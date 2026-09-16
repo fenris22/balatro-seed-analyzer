@@ -1,0 +1,3 @@
+cp -r /mnt/c/Users/fenris/Documents/devprojects/balatro-seed-analyzer ~/dev/
+cd ~/dev/balatro-seed-analyzer
+./gradlew jmh
