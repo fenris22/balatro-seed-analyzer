@@ -9,57 +9,6 @@ data class ItemLocation(
 
 object Util {
 
-    fun jokerInAnte(report: AnteReport, target: Item, limit: Int, edition: Item? = null): List<ItemLocation> {
-        val result = mutableListOf<ItemLocation>()
-        result.addAll(jokerInShop(report, target, edition, limit))
-        result.addAll(jokerInPack(report, target, edition))
-        return result
-    }
-
-    fun jokerInShop(report: AnteReport, target: Item, edition: Item? = null, limit: Int = Int.MAX_VALUE): List<ItemLocation> {
-        val result = mutableListOf<ItemLocation>()
-        val items = report.shopItems
-        for (index in items.indices) {
-            if (index >= limit) break // items are in shop-position order, so we can stop early
-            val item = items[index]
-            if (item.item === target && (edition == null || item.edition === edition)) {
-                result.add(ItemLocation(report.ante, index + 1, "Shop", item.item))
-            }
-        }
-        return result
-    }
-
-    fun jokerInPack(report: AnteReport, target: Item, edition: Item? = null): List<ItemLocation> {
-        val result = mutableListOf<ItemLocation>()
-        val packs = report.packs
-        for (index in packs.indices) {
-            val pack = packs[index]
-            if (pack.kind.family != "Buffoon") continue
-
-            var hasTarget = false
-            var hasEdition = edition == null
-            for ((_, item, _, edition1) in pack.jokers) {
-                if (item === target) hasTarget = true
-                if (edition != null && edition1 === edition) hasEdition = true
-                if (hasTarget && hasEdition) break
-            }
-                if (hasTarget && hasEdition) {
-                    result.add(ItemLocation(report.ante, index + 1, "Pack", target))
-                }
-            }
-            return result
-    }
-
-    fun spectralInPack(report: AnteReport, target: StandardCard): List<Pair<Int, StandardCard>> {
-    return report.packs
-        .mapIndexed { index, result -> Pair(index, result) }
-        .filter { it.second.kind.family == "Spectral" && it.second.cards.contains(target) }
-        .map { Pair(it.first, target) }
-    }
-
-
-
-
     private val jokerByDisplayName: Map<String, Item> by lazy { Pools.JOKERS.associateBy { it.displayName } }
     private val editionByDisplayName: Map<String, Item> by lazy { Pools.EDITIONS.associateBy { it.displayName } }
     private val tarotByDisplayName: Map<String, Item> by lazy { Pools.TAROTS.associateBy { it.displayName } }

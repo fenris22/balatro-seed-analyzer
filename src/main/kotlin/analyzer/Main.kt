@@ -1,10 +1,8 @@
 package analyzer
 
 import analyzer.Util.cardFromDisplayName
-import analyzer.Util.jokerFromDisplayName
 import analyzer.Util.mapToItem
 import analyzer.Util.nextSeed
-import analyzer.Util.tarotFromDisplayName
 import executor.Task
 import executor.TaskManager
 import kotlinx.coroutines.Dispatchers
@@ -212,9 +210,8 @@ fun interface ItemSource {
 val PackJokers = ItemSource { report, sink ->
     val ante = report.ante
     var slot = 0
-    for (pack in report.packs) {
-        if (pack.kind.family != "Buffoon") continue
-        val jokers = pack.jokers
+    for ((kind, jokers) in report.packs) {
+        if (kind.family != "Buffoon") continue
         for (k in jokers.indices) {
             slot++
             if (sink.isComplete) return@ItemSource
