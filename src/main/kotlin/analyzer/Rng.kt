@@ -144,7 +144,14 @@ object RngKeys {
 
     const val SRC_NONE = 0; const val SRC_SHO = 1; const val SRC_BUF = 2
     const val SRC_AR1 = 3; const val SRC_PL1 = 4; const val SRC_SPE = 5
-    const val SOURCE_COUNT = 6
+
+    /**
+     * The Soul's own source. Balatro creates the legendary joker with key_append "sou",
+     * so its edition rolls on "edisou<ante>" -- a stream nothing else touches, which is
+     * why adding it cannot disturb any existing result.
+     */
+    const val SRC_SOU = 6
+    const val SOURCE_COUNT = 7
 
     const val MAX_ANTE = 15
     const val MAX_RESAMPLE = 16
@@ -152,11 +159,11 @@ object RngKeys {
     /** Total addressable streams; the per-worker state array is this long. */
     const val STREAM_COUNT = FAMILY_COUNT * SOURCE_COUNT * (MAX_ANTE + 1) * MAX_RESAMPLE
 
-    val SOURCE_NAMES = arrayOf("", "sho", "buf", "ar1", "pl1", "spe")
+    val SOURCE_NAMES = arrayOf("", "sho", "buf", "ar1", "pl1", "spe", "sou")
 
     fun sourceId(source: String): Int = when (source) {
         "sho" -> SRC_SHO; "buf" -> SRC_BUF; "ar1" -> SRC_AR1
-        "pl1" -> SRC_PL1; "spe" -> SRC_SPE
+        "pl1" -> SRC_PL1; "spe" -> SRC_SPE; "sou" -> SRC_SOU
         else -> SRC_NONE
     }
 
@@ -244,7 +251,14 @@ object RngKeys {
  *    100+ cache misses per seed, at the cost of a handful up front.
  */
 class RngCache {
-    private var seedString: String = ""
+    /**
+     * The seed as characters rather than a String: at 10M seeds the String and its
+     * backing array are 20M allocations that exist only to be read 8 characters at a
+     * time. The worker owns one buffer and refills it.
+     */
+    private var seedChars = CharArray(16)
+    private var seedLen = 0
+
     var hashedSeed: Double = 0.0
         private set
 
@@ -263,21 +277,39 @@ class RngCache {
         reset(seed)
     }
 
-    fun reset(seed: String) {
+    /** Primitive form: [chars] must already be uppercase. */
+    fun reset(chars: CharArray, len: Int) {
         for (i in 0 until touchedCount) state[touched[i]] = Double.NaN
         touchedCount = 0
         if (!overflow.isEmpty()) overflow.clear()
         java.util.Arrays.fill(prefix, Double.NaN)
-        seedString = seed
-        hashedSeed = pseudohash(seed)
+        if (seedChars.size < len) seedChars = CharArray(len)
+        if (chars !== seedChars) System.arraycopy(chars, 0, seedChars, 0, len)
+        seedLen = len
+        hashedSeed = selfHash()
+    }
+
+    fun reset(seed: String) {
+        val n = seed.length
+        if (seedChars.size < n) seedChars = CharArray(n)
+        for (i in 0 until n) seedChars[i] = seed[i].uppercaseChar()
+        reset(seedChars, n)
+    }
+
+    /** pseudohash(seed), over the character buffer. */
+    private fun selfHash(): Double {
+        var num = 1.0
+        for (i in seedLen - 1 downTo 0) {
+            num = frac(PSEUDOHASH_K / num * seedChars[i].code.toDouble() * PI + PI * (i + 1))
+        }
+        return num
     }
 
     /** First loop of pseudohash: seed characters only, parameterised by key length. */
     private fun seedPrefix(keyLen: Int): Double {
         var num = 1.0
-        val s = seedString
-        for (i in s.length - 1 downTo 0) {
-            num = frac(PSEUDOHASH_K / num * s[i].code.toDouble() * PI + PI * (keyLen + i + 1))
+        for (i in seedLen - 1 downTo 0) {
+            num = frac(PSEUDOHASH_K / num * seedChars[i].code.toDouble() * PI + PI * (keyLen + i + 1))
         }
         return num
     }
@@ -332,5 +364,13 @@ class RngCache {
         (random(family, source, ante, resample) * bound).toInt()
 
     fun <T> randChoice(family: Int, source: Int, ante: Int, resample: Int, pool: List<T>): T =
+        pool[randIndex(family, source, ante, resample, pool.size)]
+
+    /**
+     * Array form. Pools are fixed at startup, and an Array load is a raw aaload where
+     * List.get is an interface call that has to stay monomorphic to be cheap. This runs
+     * on every single draw, so it is worth not leaving to the JIT.
+     */
+    fun randChoice(family: Int, source: Int, ante: Int, resample: Int, pool: Array<Item>): Item =
         pool[randIndex(family, source, ante, resample, pool.size)]
 }

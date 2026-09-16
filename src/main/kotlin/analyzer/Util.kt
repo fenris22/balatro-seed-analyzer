@@ -13,6 +13,8 @@ object Util {
     private val editionByDisplayName: Map<String, Item> by lazy { Pools.EDITIONS.associateBy { it.displayName } }
     private val tarotByDisplayName: Map<String, Item> by lazy { Pools.TAROTS.associateBy { it.displayName } }
     private val cardByDisplayName: Map<String, Item> by lazy { Pools.CARDS.associateBy { it.displayName } }
+    private val spectralByDisplayName: Map<String, Item> by lazy { Pools.SPECTRALS.associateBy { it.displayName } }
+
 
     fun jokerFromDisplayName(displayName: String): Item =
         jokerByDisplayName[displayName] ?: error("Unknown joker: $displayName")
@@ -26,49 +28,11 @@ object Util {
     fun cardFromDisplayName(displayName: String): Item =
         cardByDisplayName[displayName] ?: error("Unknown card: $displayName")
 
+    fun spectralFromDisplayName(displayName: String): Item =
+        spectralByDisplayName[displayName] ?: error("Unknown spectral: $displayName")
 
-    fun List<ShopItem>.mapToItem(): List<Item> = this.map { it.item }
-    fun List<StandardCard>.mapToItem(): List<Item> = this.map { it.base }
 
     //val knownSeed = "5I2A9TS8"
-    private const val seedChars = "123456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
-    private var currentSeed = ""
-
-    fun nextSeed(): String {
-        if (currentSeed.isEmpty()) {
-            currentSeed = seedChars[0].toString()
-            return currentSeed
-        }
-
-        val chars = currentSeed.toCharArray()
-        var carry = true
-        var i = chars.size - 1
-
-        // Increment characters from right to left
-        while (i >= 0 && carry) {
-            val charIndex = seedChars.indexOf(chars[i])
-            if (charIndex == seedChars.length - 1) {
-                // Wrap around to the first character
-                chars[i] = seedChars[0]
-                carry = true
-            } else {
-                // Move to the next character in seedChars
-                chars[i] = seedChars[charIndex + 1]
-                carry = false
-            }
-            i--
-        }
-
-        // If carry persisted past the first position, append a new leading character
-        currentSeed = if (carry) {
-            "${seedChars[0]}${String(chars)}"
-        } else {
-            String(chars)
-        }
-
-        return currentSeed
-
-    }
 
     fun printReport(r: AnteReport) {
         println("\n==ANTE ${r.ante}==")
@@ -86,6 +50,7 @@ object Util {
                 p.jokers.isNotEmpty() -> p.jokers.joinToString(", ") { j ->
                     (j.edition?.let { it.displayName + " " } ?: "") + j.item.displayName
                 }
+
                 p.consumables.isNotEmpty() -> p.consumables.joinToString(", ") { it.displayName }
                 else -> p.cards.joinToString(", ") { it.toString() }
             }
@@ -93,4 +58,32 @@ object Util {
         }
     }
 
+    /**
+     * RequestSpec(jokerFromDisplayName("Blueprint"), slotTarget = 1, anteTarget = 1),
+     * RequestSpec(jokerFromDisplayName("Baron"), slotTarget = 2, anteTarget = 1),
+     * RequestSpec(jokerFromDisplayName("Mime"), slotTarget = 3, anteTarget = 1),
+     * RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, anteTarget = 1),
+     * RequestSpec(jokerFromDisplayName("Brainstorm"), editionTarget = editionFromDisplayName("Foil"), slotTarget = 2, anteTarget = 1),
+     * RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, anteTarget = 1),
+     * RequestSpec(Item("The_Soul", "The Soul"), slotTarget = 1, anteTarget = 1, antePriority = 10),
+     * RequestSpec(jokerFromDisplayName("Perkeo"), slotTarget = 1, slotPriority = 10, anteTarget = 1, antePriority = 10)
+     * RequestSpec(jokerFromDisplayName("Perkeo"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 10, anteTarget = 1, antePriority = 10)
+     * RequestSpec(Item("The_Soul", "The Soul"), slotTarget = 1, anteTarget = 1, antePriority = 10),
+     *
+
+    6 results in the first 10_000_000 seeds
+    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, anteTarget = 1),
+    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, anteTarget = 1),
+
+    RequestSpec(tarotFromDisplayName("The Hermit"), slotTarget = 1, anteTarget = 1),
+    RequestSpec(tarotFromDisplayName("Temperance"), slotTarget = 1, anteTarget = 1),
+    RequestSpec(tarotFromDisplayName("The Fool"), slotTarget = 2, anteTarget = 1),
+    RequestSpec(tarotFromDisplayName("The Fool"), slotTarget = 1, anteTarget = 1),
+
+
+     */
+
+
+//      //5 seconds
+    //48SP scored highest
 }

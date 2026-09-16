@@ -11,13 +11,18 @@ repositories {
     mavenCentral()
 }
 
+tasks.withType<JavaExec> { jvmArgs("--enable-native-access=ALL-UNNAMED") }
+
 dependencies {
+    implementation("org.jocl:jocl:2.0.5")
     jmh("org.openjdk.jmh:jmh-core:1.37")
     jmhAnnotationProcessor("org.openjdk.jmh:jmh-generator-annprocess:1.37")
     implementation("it.unimi.dsi:fastutil:8.5.13")
     testImplementation(kotlin("test"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
 }
+
+
 
 kotlin {
     jvmToolchain(25)
