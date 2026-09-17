@@ -32,7 +32,7 @@ object Util {
         spectralByDisplayName[displayName] ?: error("Unknown spectral: $displayName")
 
 
-    //val knownSeed = "5I2A9TS8"
+
 
     fun printReport(r: AnteReport) {
         println("\n==ANTE ${r.ante}==")
@@ -58,6 +58,7 @@ object Util {
         }
     }
 
+    //val knownSeed = "5I2A9TS8"
     /**
      * RequestSpec(jokerFromDisplayName("Blueprint"), slotTarget = 1, anteTarget = 1),
      * RequestSpec(jokerFromDisplayName("Baron"), slotTarget = 2, anteTarget = 1),
@@ -82,8 +83,4 @@ object Util {
 
 
      */
-
-
-//      //5 seconds
-    //48SP scored highest
 }

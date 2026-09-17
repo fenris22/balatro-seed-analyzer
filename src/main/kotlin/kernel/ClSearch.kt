@@ -150,6 +150,11 @@ object ClSearch {
         clGetDeviceInfo(device, param, 0, null, size)
         val buf = ByteArray(size[0].toInt())
         clGetDeviceInfo(device, param, buf.size.toLong(), Pointer.to(buf), null)
+
+        val cus = IntArray(1)
+        clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, 4, Pointer.to(cus), null)
+        println("compute units: ${cus[0]}")
+
         return String(buf, 0, maxOf(0, buf.size - 1))
     }
 
@@ -176,7 +181,7 @@ object ClSearch {
 
     private fun loadSource(): String =
         ClSearch::class.java.getResourceAsStream("/search.cl")?.bufferedReader()?.readText()
-            ?: java.io.File("src/main/kotlin/kernel/search.cl").takeIf { it.exists() }?.readText()
+            ?: java.io.File("/search.cl").takeIf { it.exists() }?.readText()
             ?: error("search.cl not found on the classpath or at opencl/search.cl")
 
     private fun buildDefines(

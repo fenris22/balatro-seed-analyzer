@@ -1,8 +1,10 @@
 plugins {
     kotlin("jvm") version "2.4.10"
     id("me.champeau.jmh") version "0.7.2"
+    id("com.gradleup.shadow") version "9.6.1"
     kotlin("kapt") version "2.4.10"
 }
+
 
 group = "org.example"
 version = "1.0-SNAPSHOT"
@@ -30,6 +32,12 @@ kotlin {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+tasks.jar {
+    manifest {
+        attributes["Main-Class"] = "analyzer.MainKt"
+    }
 }
 
 jmh {

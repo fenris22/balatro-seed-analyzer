@@ -1,5 +1,6 @@
 package analyzer
 
+import analyzer.RequestSpec.Companion.NO_EDITION
 import analyzer.Util.editionFromDisplayName
 import analyzer.Util.jokerFromDisplayName
 import analyzer.Util.spectralFromDisplayName
@@ -499,7 +500,7 @@ suspend fun main() {
     val maxAnte = 4
     val shopItems = 50
     val startIndex = 0L
-    val seedsToCount = 1_000_000_000L
+    val seedsToCount = 100_000_000L
     val ignoredVouchers = listOf("Planet_Merchant", "Magic_Trick")
 
     // Item Requests. A legendary joker here is matched against the Soul queue, where the
@@ -509,9 +510,10 @@ suspend fun main() {
         RequestSpec(Item("The_Soul", "The Soul"), slotTarget = 1, anteTarget = 2, antePriority = 10),
         RequestSpec(tarotFromDisplayName("Temperance"), slotTarget = 1, slotPriority = 5, anteTarget = 2, antePriority = 5),
         RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 3, anteTarget = 2, antePriority = 5),
+        RequestSpec(jokerFromDisplayName("Blueprint"), slotTarget = 1, slotPriority = 3, anteTarget = 2, antePriority = 5),
     )
 
-    //todo gpu code for spectrals, planets, tags, bosses in that order
+    //todo gpu code for spectrals
 
     val detail = Detail.forItems(
         specs.map { it.item },
