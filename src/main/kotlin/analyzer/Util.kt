@@ -73,13 +73,55 @@ object Util {
      *
 
     6 results in the first 10_000_000 seeds
-    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, anteTarget = 1),
-    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, anteTarget = 1),
+    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 2, anteTarget = 1),
+    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 2, anteTarget = 2),
 
     RequestSpec(tarotFromDisplayName("The Hermit"), slotTarget = 1, anteTarget = 1),
     RequestSpec(tarotFromDisplayName("Temperance"), slotTarget = 1, anteTarget = 1),
     RequestSpec(tarotFromDisplayName("The Fool"), slotTarget = 2, anteTarget = 1),
     RequestSpec(tarotFromDisplayName("The Fool"), slotTarget = 1, anteTarget = 1),
+
+    RequestSpec(jokerFromDisplayName("Perkeo"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 20, anteTarget = 2, antePriority = 10) ,
+    RequestSpec(Item("The_Soul", "The Soul"), slotTarget = 1, anteTarget = 2, antePriority = 10),
+    RequestSpec(tarotFromDisplayName("Temperance"), slotTarget = 1, slotPriority = 5, anteTarget = 2, antePriority = 5),
+    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 3, anteTarget = 2, antePriority = 5),
+    RequestSpec(jokerFromDisplayName("Blueprint"), slotTarget = 1, slotPriority = 3, anteTarget = 2, antePriority = 5),
+
+
+    RequestSpec(jokerFromDisplayName("Perkeo"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 20, anteTarget = 2, antePriority = 10) ,
+    RequestSpec(Item("The_Soul", "The Soul"), slotTarget = 1, anteTarget = 2, antePriority = 10),
+    RequestSpec(tarotFromDisplayName("Temperance"), slotTarget = 3, slotPriority = 5, anteTarget = 2, antePriority = 5),
+    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 4, anteTarget = 2, antePriority = 3),
+    RequestSpec(jokerFromDisplayName("Blueprint"), slotTarget = 1, slotPriority = 4, anteTarget = 2, antePriority = 3),
+    RequestSpec(jokerFromDisplayName("Showman"), slotTarget = 1, slotPriority = 8, anteTarget = 1, antePriority = 10),
+
+     OLD CONDITIONS, NEW CONDITIONS:
+
+
+
+
+    // A Turtle Bean in ante 8, in the shop or a pack. Closer to slot 1 scores higher.
+    Condition(
+    jokerFromDisplayName("Turtle Bean"),
+    required = true,
+    anteRange = 8..8,
+    slotRange = 1..50,
+    sources = Src.SHOP_OR_PACK,
+    slotPriority = 6,
+    ),
+
+
+
+    // A Negative Tag anywhere in antes 2-8. Not required, so it is pure bonus score.
+    Condition(
+    Pools.TAGS.first { it.id == "Negative_Tag" },
+    anteRange = 2..8,
+    sources = Src.TAG,
+    antePriority = 2,
+    ),
+
+
+
 
 
      */

@@ -6,8 +6,8 @@ plugins {
 }
 
 
-group = "org.example"
-version = "1.0-SNAPSHOT"
+group = "cx.tfe"
+version = "1.0"
 
 repositories {
     mavenCentral()

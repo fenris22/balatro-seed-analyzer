@@ -250,6 +250,13 @@ class Detail(
     }
 }
 
+/**
+ * Hard ceiling on any resample loop. Well above anything reachable by chance -- the device
+ * gives up at 16 and that fires on 0.003% of seeds -- so hitting this means the loop has no
+ * terminating draw at all, not that it was unlucky.
+ */
+const val RESAMPLE_LIMIT = 64
+
 /** Shared placeholders, so a skipped draw costs no allocation. */
 object Placeholder {
     val ITEM = Item("SKIPPED", "(not generated)")
@@ -294,6 +301,14 @@ class SeedAnalyzer(
     /** Legendary jokers already handed out this run, and how many Souls have appeared. */
     private val legendaryTaken = BooleanArray(PoolArr.LEGENDARY_JOKERS.size)
     private var soulCount = 0
+
+    /**
+     * Set when a resample loop cannot terminate, e.g. a sixth Soul when all five legendary
+     * jokers are already held. The GPU escapes these by flagging the seed and punting it
+     * here; without a matching bound this side simply spins, which is exactly what it did.
+     * Callers must check [aborted] and drop the seed.
+     */
+    private var resampleOverflow = false
     private var soulEdition: Item? = null
 
     /** Output of drawJoker, to avoid allocating a ShopItem per joker on the filter path. */
@@ -319,7 +334,11 @@ class SeedAnalyzer(
         resetState()
     }
 
+    /** True when the last scanned seed could not be resolved; its results are meaningless. */
+    val aborted: Boolean get() = resampleOverflow
+
     private fun resetState() {
+        resampleOverflow = false
         java.util.Arrays.fill(voucherActive, false)
         java.util.Arrays.fill(legendaryTaken, false)
         usedNormalBosses.clear()
@@ -354,6 +373,7 @@ class SeedAnalyzer(
         var idx = rng.randIndex(RngKeys.VOUCHER, 0, ante, 0, n)
         while (voucherLocked(idx)) {
             resample++
+            if (resample >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
             idx = rng.randIndex(RngKeys.VOUCHER, 0, ante, resample, n)
         }
         if (!voucherIgnored[idx]) {
@@ -444,6 +464,7 @@ class SeedAnalyzer(
             var n = 0
             while (isExcluded(joker)) {
                 n++
+                if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
                 joker = rng.randChoice(family, keySrc, keyAnte, n, pool)
             }
             exclude(joker)
@@ -470,8 +491,13 @@ class SeedAnalyzer(
         val pool = PoolArr.LEGENDARY_JOKERS
         var n = 0
         var idx = rng.randIndex(RngKeys.JOKER4, 0, 0, 0, pool.size)
+        // With only five legendary jokers, a run that turns up a sixth Soul has nothing
+        // left to give: every index is taken and this condition can never clear. Whether
+        // the game repeats a legendary at that point is a modelling question worth
+        // settling, but it must not be an infinite loop either way.
         while (legendaryTaken[idx]) {
             n++
+            if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
             idx = rng.randIndex(RngKeys.JOKER4, 0, 0, n, pool.size)
         }
         legendaryTaken[idx] = true
@@ -522,6 +548,7 @@ class SeedAnalyzer(
             var n = 0
             while (isExcluded(item)) {
                 n++
+                if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
                 item = rng.randChoice(RngKeys.TAROT, srcId, ante, n, PoolArr.TAROTS)
             }
             exclude(item)
@@ -536,6 +563,7 @@ class SeedAnalyzer(
             var n = 0
             while (isExcluded(item)) {
                 n++
+                if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
                 item = rng.randChoice(RngKeys.PLANET, srcId, ante, n, PoolArr.PLANETS)
             }
             exclude(item)
@@ -557,6 +585,7 @@ class SeedAnalyzer(
         var n = 0
         while (item.id == "RETRY" || (useExcluded && isExcluded(item))) {
             n++
+            if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
             item = rng.randChoice(RngKeys.SPECTRAL, srcId, ante, n, PoolArr.SPECTRALS)
         }
         if (useExcluded) exclude(item)
@@ -699,6 +728,7 @@ class SeedAnalyzer(
                 var idx = rng.randIndex(RngKeys.TAG, 0, ante, 0, n)
                 while (PoolArr.TAG_GATED[idx] && ante < 2) {
                     r++
+                    if (r >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
                     idx = rng.randIndex(RngKeys.TAG, 0, ante, r, n)
                 }
                 sink.onTag(ante, which, PoolArr.TAGS[idx])
