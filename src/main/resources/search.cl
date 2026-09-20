@@ -447,6 +447,7 @@ __kernel void search(
     __constant const double *packCum,
     __constant const uchar  *voucherIgnored,
     __global const int      *remap,
+    __constant const int    *anteEnd,        // one past the last stream of each ante
     __global double         *state,
     __global int            *hitIndex,         // seed offsets within this chunk
     __global double         *hitScore,
@@ -507,7 +508,10 @@ __kernel void search(
 
     for (uint seedOff = grabbed + lid; seedOff < grabEnd; seedOff += lsz) {
 
-        for (int i = 0; i < nStreams; i++) state[(size_t)i * gsize + gid] = NAN;
+        // Only the streams with no ante of their own are cleared up front. Each ante's own
+        // slice is cleared as that ante starts, so a seed killed in ante 1 never pays to
+        // clear antes 2..N -- which with a high MAX_SEARCH_ANTE is most of the table.
+        for (int i = anteEnd[MAX_SEARCH_ANTE]; i < nStreams; i++) state[(size_t)i * gsize + gid] = NAN;
         g.havePrefix = 0u;
         g.overflow = 0;
         g.seedLen = seed_for_index(baseIndex + (ulong)seedOff, &g.seedLo, &g.seedHi);
@@ -532,6 +536,11 @@ __kernel void search(
         int abandoned = 0;
 
         for (int ante = 1; ante <= MAX_SEARCH_ANTE && !abandoned && !g.overflow; ante++) {
+
+            // This ante's slice of the stream table, freshly uninitialised.
+            for (int i = anteEnd[ante - 1]; i < anteEnd[ante]; i++) {
+                state[(size_t)i * gsize + gid] = NAN;
+            }
 
             // ---- voucher (never skippable: it sets the shop rates) ----
             int vIdx;

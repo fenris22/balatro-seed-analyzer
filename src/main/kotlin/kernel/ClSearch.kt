@@ -20,7 +20,15 @@ import org.jocl.CL.*
 object ClSearch {
 
     const val MAX_KEY_LEN = 32
-    const val MAX_LEN_SLOTS = 16
+    /**
+     * Ceiling on distinct key lengths, which sizes the kernel's per-work-item prefix cache.
+     *
+     * The count grows with the highest ante searched, because a two-digit ante makes every
+     * key one character longer -- an ante-12 search needs noticeably more slots than an
+     * ante-6 one. 32 is the hard limit: havePrefix is a uint bitmask. The kernel is
+     * compiled with the actual count, not this ceiling, so raising it costs nothing.
+     */
+    const val MAX_LEN_SLOTS = 32
 
     /** Work items per compute unit. The state buffer scales with this, nothing else. */
     const val GLOBAL_SIZE = 8192
@@ -163,6 +171,16 @@ object ClSearch {
             }
         }
 
+        /**
+         * anteEnd[a] is one past the last stream belonging to ante a.
+         *
+         * The table is built ante-major, so every ante's streams are contiguous. That lets
+         * the kernel clear only the slice for the ante it is about to run instead of the
+         * whole table per seed -- which matters a lot when the highest ante searched is 12
+         * but most seeds are killed in ante 1 or 2.
+         */
+        val anteEnd = IntArray(maxAnte + 1)
+
         init {
             val packDedup = 8
             for (a in 1..maxAnte) {
@@ -199,7 +217,10 @@ object ClSearch {
                     add(RngKeys.SOUL_SPECTRAL, 0, a)
                     if (wantEditions) add(RngKeys.EDITION, RngKeys.SRC_SOU, a)
                 }
+                anteEnd[a] = ids.size
             }
+            // Streams with no ante of their own (the Soul's legendary queue) live past the
+            // last ante's slice and are cleared once per seed.
             if (wantSouls) add(RngKeys.JOKER4, 0, 0, packDedup)
         }
 
@@ -390,16 +411,38 @@ object ClSearch {
         private val finished = java.util.concurrent.atomic.AtomicLong()
         private val end = start + total
 
+        /**
+         * Blocks handed out but not yet finished.
+         *
+         * Needed for [watermark]: with several devices pulling blocks, they finish out of
+         * order, so "how far have we got" is not the same as "how many seeds are done".
+         */
+        private val inFlight = java.util.concurrent.ConcurrentSkipListSet<Long>()
+
         /** Base index of the next block, or -1 when the range is exhausted. */
         fun take(): Long {
             val b = next.getAndAdd(block)
-            return if (b >= end) -1L else b
+            if (b >= end) return -1L
+            inFlight.add(b)
+            return b
         }
 
         fun sizeOf(base: Long): Int = minOf(block, end - base).toInt()
 
         /** Records a finished block and returns the running total across all devices. */
-        fun complete(n: Int): Long = finished.addAndGet(n.toLong())
+        fun complete(base: Long, n: Int): Long {
+            inFlight.remove(base)
+            return finished.addAndGet(n.toLong())
+        }
+
+        /**
+         * The lowest index not yet fully searched -- a safe point to resume from.
+         *
+         * Everything below the oldest in-flight block is finished, so restarting there
+         * re-scans at most the blocks that were still running. Resuming from "seeds done"
+         * instead would silently skip a block that a slower device had not finished.
+         */
+        fun watermark(): Long = inFlight.firstOrNull() ?: minOf(next.get(), end)
     }
 
     // --- the run --------------------------------------------------------------
@@ -431,6 +474,8 @@ object ClSearch {
         puntSink: PuntResolver? = null,
         /** Shared across devices by runMulti; run() makes its own when given none. */
         dispenser: SeedDispenser? = null,
+        /** Called after every chunk with (seeds searched so far, safe resume index). */
+        onChunk: ((Long, Long) -> Unit)? = null,
         onHit: (Long, Double) -> Unit,
     ) {
         whyUnsupported(detail, conditions)?.let { throw Unsupported(it) }
@@ -531,6 +576,7 @@ object ClSearch {
         args.add(keep(roDoubles(PoolArr.PACK_CUM)))
         args.add(keep(roBytes(voucherIgnored)))
         args.add(keep(roInts(streams.remap)))
+        args.add(keep(roInts(streams.anteEnd)))
 
         val bState = keep(clCreateBuffer(context, CL_MEM_READ_WRITE,
             nStreams.toLong() * globalSize * Sizeof.cl_double, null, null))
@@ -692,7 +738,8 @@ object ClSearch {
             }
 
             done += chunk
-            val globalDone = work.complete(chunk)
+            val globalDone = work.complete(base, chunk)
+            onChunk?.invoke(globalDone, work.watermark())
             val hostNs = System.nanoTime() - tHost
             kernelTotalNs += kernelNs
             hostTotalNs += hostNs
@@ -833,6 +880,7 @@ object ClSearch {
         seedCount: Long,
         cutoffOf: () -> Double,
         devices: List<Pair<cl_platform_id, cl_device_id>>? = null,
+        onChunk: ((Long, Long) -> Unit)? = null,
         onHit: (Long, Double) -> Unit,
     ) {
         println("Scanning for GPUs:")
@@ -841,7 +889,7 @@ object ClSearch {
 
         if (found.size == 1) {
             run(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                startIndex, seedCount, cutoffOf, onHit = onHit)
+                startIndex, seedCount, cutoffOf, onChunk = onChunk, onHit = onHit)
             return
         }
 
@@ -863,7 +911,7 @@ object ClSearch {
                 try {
                     run(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
                         startIndex, seedCount, cutoffOf, deviceOverride = dev, label = "[gpu$i] ",
-                        puntSink = punts, dispenser = work, onHit = onHit)
+                        puntSink = punts, dispenser = work, onChunk = onChunk, onHit = onHit)
                 } catch (t: Throwable) {
                     failures.add(t)
                     println("[gpu$i] FAILED: ${t.message}")

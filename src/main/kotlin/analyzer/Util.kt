@@ -59,41 +59,8 @@ object Util {
     }
 
     //val knownSeed = "5I2A9TS8"
+
     /**
-     * RequestSpec(jokerFromDisplayName("Blueprint"), slotTarget = 1, anteTarget = 1),
-     * RequestSpec(jokerFromDisplayName("Baron"), slotTarget = 2, anteTarget = 1),
-     * RequestSpec(jokerFromDisplayName("Mime"), slotTarget = 3, anteTarget = 1),
-     * RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, anteTarget = 1),
-     * RequestSpec(jokerFromDisplayName("Brainstorm"), editionTarget = editionFromDisplayName("Foil"), slotTarget = 2, anteTarget = 1),
-     * RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, anteTarget = 1),
-     * RequestSpec(Item("The_Soul", "The Soul"), slotTarget = 1, anteTarget = 1, antePriority = 10),
-     * RequestSpec(jokerFromDisplayName("Perkeo"), slotTarget = 1, slotPriority = 10, anteTarget = 1, antePriority = 10)
-     * RequestSpec(jokerFromDisplayName("Perkeo"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 10, anteTarget = 1, antePriority = 10)
-     * RequestSpec(Item("The_Soul", "The Soul"), slotTarget = 1, anteTarget = 1, antePriority = 10),
-     *
-
-    6 results in the first 10_000_000 seeds
-    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 2, anteTarget = 1),
-    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 2, anteTarget = 2),
-
-    RequestSpec(tarotFromDisplayName("The Hermit"), slotTarget = 1, anteTarget = 1),
-    RequestSpec(tarotFromDisplayName("Temperance"), slotTarget = 1, anteTarget = 1),
-    RequestSpec(tarotFromDisplayName("The Fool"), slotTarget = 2, anteTarget = 1),
-    RequestSpec(tarotFromDisplayName("The Fool"), slotTarget = 1, anteTarget = 1),
-
-    RequestSpec(jokerFromDisplayName("Perkeo"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 20, anteTarget = 2, antePriority = 10) ,
-    RequestSpec(Item("The_Soul", "The Soul"), slotTarget = 1, anteTarget = 2, antePriority = 10),
-    RequestSpec(tarotFromDisplayName("Temperance"), slotTarget = 1, slotPriority = 5, anteTarget = 2, antePriority = 5),
-    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 3, anteTarget = 2, antePriority = 5),
-    RequestSpec(jokerFromDisplayName("Blueprint"), slotTarget = 1, slotPriority = 3, anteTarget = 2, antePriority = 5),
-
-
-    RequestSpec(jokerFromDisplayName("Perkeo"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 20, anteTarget = 2, antePriority = 10) ,
-    RequestSpec(Item("The_Soul", "The Soul"), slotTarget = 1, anteTarget = 2, antePriority = 10),
-    RequestSpec(tarotFromDisplayName("Temperance"), slotTarget = 3, slotPriority = 5, anteTarget = 2, antePriority = 5),
-    RequestSpec(jokerFromDisplayName("Blueprint"), editionTarget = editionFromDisplayName("Negative"), slotTarget = 1, slotPriority = 4, anteTarget = 2, antePriority = 3),
-    RequestSpec(jokerFromDisplayName("Blueprint"), slotTarget = 1, slotPriority = 4, anteTarget = 2, antePriority = 3),
-    RequestSpec(jokerFromDisplayName("Showman"), slotTarget = 1, slotPriority = 8, anteTarget = 1, antePriority = 10),
 
      OLD CONDITIONS, NEW CONDITIONS:
 
@@ -122,6 +89,137 @@ object Util {
 
 
 
+     // A Showman in the first six shop cards of ante 1 or 2, or in a pack.
+     Condition(
+     jokerFromDisplayName("Showman"),
+     required = true,
+     anteRange = 1..2,
+     slotRange = 1..6,
+     sources = Src.SHOP_OR_PACK,
+     slotPriority = 8,
+     antePriority = 10,
+     ),
+
+     // Temperance in the first eight shop cards only -- explicitly not from a pack.
+     Condition(
+     tarotFromDisplayName("Temperance"),
+     required = true,
+     anteRange = 1..2,
+     slotRange = 1..8,
+     sources = Src.SHOP,
+     slotPriority = 5,
+     ),
+
+     // At least five Blueprints or Brainstorms, antes 2-8, shop or pack.
+     // Earlier shop slots and earlier antes score higher.
+     Condition(
+     listOf(jokerFromDisplayName("Blueprint"), jokerFromDisplayName("Brainstorm")),
+     count = 5,
+     required = true,
+     anteRange = 2..8,
+     slotRange = 1..50,
+     sources = Src.SHOP_OR_PACK,
+     slotPriority = 4,
+     antePriority = 3,
+     label = "5x Blueprint/Brainstorm",
+
+     ),
+
+     // ...and at least one of them a natural Negative. A Negative Blueprint counts
+     // toward both this and the condition above; that is the intended reading.
+     Condition(
+     listOf(jokerFromDisplayName("Blueprint"), jokerFromDisplayName("Brainstorm")),
+     required = true,
+     anteRange = 2..8,
+     slotRange = 1..50,
+     sources = Src.SHOP_OR_PACK,
+     editionTarget = editionFromDisplayName("Negative"),
+     editionPriority = 20,
+     label = "a Negative Blueprint/Brainstorm",
+     ),
+
+
+
+
+
+     Condition(
+     val items: List<Item>,
+     val count: Int = 1,
+     val required: Boolean = false,
+     val anteRange: IntRange = 1..8,
+     val slotRange: IntRange = 1..NO_SLOT_LIMIT,
+     val sources: Int = Src.SHOP_OR_PACK,
+     val editionTarget: Item? = null,
+     val editionPriority: Int = 1,
+     anteTarget: Int? = null,
+     val antePriority: Int = 1,
+     slotTarget: Int? = null,
+     val slotPriority: Int = 1,
+     val label: String? = null,
+     )
+
+
+     Possible sources:
+     Src.
+         SHOP
+         PACK
+         SOUL
+         TAG
+         VOUCHER
+         BOSS
+         ANY
+         SHOP_OR_PACK
+
+
+
+     // A negative Perkeo from one of the first three Souls of the run.
+     Condition(
+     jokerFromDisplayName("Chicot"),
+     required = true,
+     anteRange = 2..5,
+     sources = Src.SOUL,
+     editionPriority = 10,
+     antePriority = 10,
+     ),
+
+     Condition(
+     jokerFromDisplayName("Perkeo"),
+     required = true,
+     anteRange = 1..3,
+     sources = Src.SOUL,
+     antePriority = 3,
+     ),
+
+     Condition(
+     listOf(jokerFromDisplayName("Blueprint"),jokerFromDisplayName("Brainstorm")),
+     required = true,
+     anteRange = 1..2,
+     antePriority = 10,
+     editionTarget = editionFromDisplayName("Negative"),
+     editionPriority = 10,
+     sources = Src.PACK,
+     ),
+
+     Condition(
+     listOf(jokerFromDisplayName("Blueprint"),jokerFromDisplayName("Brainstorm")),
+     required = true,
+     anteRange = 3..6,
+     antePriority = 2,
+     editionTarget = editionFromDisplayName("Negative"),
+     editionPriority = 10,
+     slotRange = 1..50,
+     slotPriority = 5,
+     sources = Src.SHOP_OR_PACK
+     ),
+
+     Condition(
+     jokerFromDisplayName("Invisible Joker"),
+     anteRange = 4..14,
+     count = 6,
+     slotRange = 1..150,
+     slotPriority = 5,
+     sources = Src.SHOP_OR_PACK
+     )
 
 
      */

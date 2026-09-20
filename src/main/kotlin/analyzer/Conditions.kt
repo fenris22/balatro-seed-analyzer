@@ -154,16 +154,16 @@ class Condition(
     init {
         require(count >= 1) { "count must be at least 1: $this" }
         require(items.isNotEmpty()) { "condition has no items: $label" }
-        require(anteMin >= 1 && anteMax >= anteMin) { "bad ante range $anteRange in $this" }
-        require(slotMin >= 1 && slotMax >= slotMin) { "bad slot range $slotRange in $this" }
+        require(anteMin in 1 .. anteMax) { "bad ante range $anteRange in $this" }
+        require(slotMin in 1 .. slotMax) { "bad slot range $slotRange in $this" }
         require(sources != 0) { "condition allows no sources: $this" }
     }
 
     /** True if this card, at this position, is inside the window. */
     fun accepts(itemId: String, edition: Item?, ante: Int, slot: Int, srcBit: Int): Boolean {
         if (sources and srcBit == 0) return false
-        if (ante < anteMin || ante > anteMax) return false
-        if (slot < slotMin || slot > slotMax) return false
+        if (ante !in anteMin .. anteMax) return false
+        if (slot !in slotMin .. slotMax) return false
         if (!acceptsEdition(edition)) return false
         for (id in itemIds) if (id == itemId) return true
         return false

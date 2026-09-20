@@ -31,6 +31,24 @@ const val USE_GPU = true
  */
 const val USE_ALL_GPUS = true
 
+// --- checkpointing ---
+
+/**
+ * Write the current best seeds every this many seeds searched. 0 disables.
+ *
+ * A long search is worth interrupting -- results only exist in memory otherwise, and a
+ * Ctrl-C or a machine reboot loses hours. Each checkpoint overwrites the file with the
+ * full current top list, so the file is always complete rather than an append log to
+ * reassemble.
+ */
+const val CHECKPOINT_EVERY_SEEDS = 100_000_000L
+
+/** Where checkpoints are written. Overwritten each time, not appended. */
+const val RESULTS_FILE = "results.txt"
+
+/** How many of the top seeds each checkpoint prints to the console. */
+const val CHECKPOINT_PRINT_TOP = 5
+
 // --- threshold calibration ---
 
 /**
@@ -189,6 +207,20 @@ private val topResults = java.util.PriorityQueue<SeedResult>(MAX_RESULTS + 1, co
 @Volatile
 var cutoff = Double.NEGATIVE_INFINITY
 
+/**
+ * A consistent copy of the current best, highest first.
+ *
+ * Taken under the lock because a checkpoint can fire while devices are still recording.
+ */
+fun snapshotResults(): List<SeedResult> {
+    resultsLock.lock()
+    try {
+        return topResults.sortedByDescending { it.score }
+    } finally {
+        resultsLock.unlock()
+    }
+}
+
 /** Cheap by design: a volatile compare, and a heap insert only when it passes. */
 fun record(seed: String, score: Double) {
     if (score <= cutoff) return
@@ -211,6 +243,7 @@ fun record(seed: String, score: Double) {
  * Runs once, on at most MAX_RESULTS seeds, so it can afford to be as slow as it likes.
  */
 private fun hydrate(
+    results: List<SeedResult>,
     conditions: Array<Condition>,
     detail: Detail,
     maxSearchAnte: Int,
@@ -222,7 +255,7 @@ private fun hydrate(
     val filter = SeedAnalyzer(detail, ignoredVouchers)
     val full = SeedAnalyzer(Detail.FULL, ignoredVouchers)
 
-    for (r in topResults) {
+    for (r in results) {
         state.reset(detail = true)
         filter.reset(r.seed)
         var antesRun = 0
@@ -308,6 +341,86 @@ class Worker(
         Stats.antes.addAndFetch(localAntes); localAntes = 0
         Stats.shopRolls.addAndFetch(localShopRolls); localShopRolls = 0
         Stats.killedByRequirement.addAndFetch(localKilled); localKilled = 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpointing
+// ---------------------------------------------------------------------------
+
+/** Set once the run has printed its own final results, so the shutdown hook stays quiet. */
+private val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+
+/** Guards against two checkpoints writing the file at once. */
+private val checkpointLock = java.util.concurrent.locks.ReentrantLock()
+
+/**
+ * Writes the current best seeds to [RESULTS_FILE] and prints a short summary.
+ *
+ * [resumeIndex] is the dispenser's watermark: the lowest index not yet fully searched.
+ * Restarting from it re-scans at most the blocks that were in flight, and never skips one
+ * -- which is why it is not simply "seeds searched so far". With several devices pulling
+ * blocks they finish out of order, so those two numbers are different.
+ */
+fun checkpoint(
+    conditions: Array<Condition>,
+    detail: Detail,
+    maxSearchAnte: Int,
+    shopItems: Int,
+    ignoredVouchers: List<String>,
+    seedsSearched: Long,
+    resumeIndex: Long,
+    reason: String,
+) {
+    if (!checkpointLock.tryLock()) return
+    try {
+        val results = snapshotResults()
+        val header = "[$reason] ${"%,d".format(seedsSearched)} seeds searched, " +
+                "${results.size} result(s) held, resume with startIndex = $resumeIndex"
+
+        if (results.isEmpty()) {
+            println("$header -- nothing to save yet")
+            return
+        }
+
+        // Filling in match detail needs a CPU rescan per seed, so it happens here rather
+        // than on the hit path. At MAX_RESULTS seeds it is a blink.
+        hydrate(results, conditions, detail, maxSearchAnte, shopItems, ignoredVouchers)
+
+        val text = buildString {
+            appendLine(header)
+            appendLine("Generated ${java.time.LocalDateTime.now()}")
+            appendLine()
+            for ((i, r) in results.withIndex()) {
+                appendLine("${i + 1}. ${r.seed}  score ${"%.0f".format(r.score)}")
+                appendLine("     ${r.summary}")
+                for (m in r.matches) appendLine("       $m")
+                val souls = r.reports.flatMap { it.soulJokers }
+                if (souls.isNotEmpty()) appendLine("       soul queue: ${souls.joinToString(", ")}")
+                appendLine()
+            }
+        }
+
+        try {
+            // Write to a temp file and move it into place, so an interrupt mid-write
+            // cannot leave a half-written results file where a complete one used to be.
+            val target = java.io.File(RESULTS_FILE)
+            val tmp = java.io.File("$RESULTS_FILE.tmp")
+            tmp.writeText(text)
+            tmp.renameTo(target)
+        } catch (e: Exception) {
+            println("  could not write $RESULTS_FILE: ${e.message}")
+        }
+
+        println(header)
+        for (r in results.take(CHECKPOINT_PRINT_TOP)) {
+            println("    ${r.seed} (${"%.0f".format(r.score)}): ${r.summary}")
+        }
+        if (results.size > CHECKPOINT_PRINT_TOP) {
+            println("    ... ${results.size - CHECKPOINT_PRINT_TOP} more in $RESULTS_FILE")
+        }
+    } finally {
+        checkpointLock.unlock()
     }
 }
 
@@ -415,9 +528,9 @@ suspend fun main() {
     val start = System.currentTimeMillis()
 
     val shopItems = 50
-    val startIndex = 85_000_000_000L
-    val seedsToCount = 65_000_000_000L
-    val ignoredVouchers = listOf("Planet_Merchant", "Magic_Trick", "Tarot_Merchant")
+    val startIndex = 0L
+    val seedsToCount = 2_300_000_000_000L
+    val ignoredVouchers = listOf("Planet_Merchant", "Magic_Trick")
 
     // -----------------------------------------------------------------------
     // Conditions
@@ -430,62 +543,52 @@ suspend fun main() {
 
         // A negative Perkeo from one of the first three Souls of the run.
         Condition(
-            jokerFromDisplayName("Perkeo"),
+            jokerFromDisplayName("Chicot"),
             required = true,
-            anteRange = 1..3,
+            anteRange = 2..5,
             sources = Src.SOUL,
-            editionTarget = editionFromDisplayName("Negative"),
             editionPriority = 10,
             antePriority = 10,
         ),
 
-        // A Showman in the first six shop cards of ante 1 or 2, or in a pack.
         Condition(
-            jokerFromDisplayName("Showman"),
+            jokerFromDisplayName("Perkeo"),
             required = true,
-            anteRange = 1..2,
-            slotRange = 1..6,
-            sources = Src.SHOP_OR_PACK,
-            slotPriority = 8,
-            antePriority = 10,
-        ),
-
-        // Temperance in the first eight shop cards only -- explicitly not from a pack.
-        Condition(
-            tarotFromDisplayName("Temperance"),
-            required = true,
-            anteRange = 1..2,
-            slotRange = 1..8,
-            sources = Src.SHOP,
-            slotPriority = 5,
-        ),
-
-        // At least five Blueprints or Brainstorms, antes 2-8, shop or pack.
-        // Earlier shop slots and earlier antes score higher.
-        Condition(
-            listOf(jokerFromDisplayName("Blueprint"), jokerFromDisplayName("Brainstorm")),
-            count = 5,
-            required = true,
-            anteRange = 2..8,
-            slotRange = 1..50,
-            sources = Src.SHOP_OR_PACK,
-            slotPriority = 4,
+            anteRange = 1..3,
+            sources = Src.SOUL,
             antePriority = 3,
-            label = "5x Blueprint/Brainstorm",
         ),
 
-        // ...and at least one of them a natural Negative. A Negative Blueprint counts
-        // toward both this and the condition above; that is the intended reading.
         Condition(
-            listOf(jokerFromDisplayName("Blueprint"), jokerFromDisplayName("Brainstorm")),
+            listOf(jokerFromDisplayName("Blueprint"),jokerFromDisplayName("Brainstorm")),
             required = true,
-            anteRange = 2..8,
-            slotRange = 1..50,
-            sources = Src.SHOP_OR_PACK,
+            anteRange = 1..2,
+            antePriority = 10,
             editionTarget = editionFromDisplayName("Negative"),
-            editionPriority = 20,
-            label = "a Negative Blueprint/Brainstorm",
+            editionPriority = 10,
+            sources = Src.PACK,
         ),
+
+        Condition(
+            listOf(jokerFromDisplayName("Blueprint"),jokerFromDisplayName("Brainstorm")),
+            required = true,
+            anteRange = 3..6,
+            antePriority = 2,
+            editionTarget = editionFromDisplayName("Negative"),
+            editionPriority = 10,
+            slotRange = 1..50,
+            slotPriority = 5,
+            sources = Src.SHOP_OR_PACK
+        ),
+
+        Condition(
+            jokerFromDisplayName("Invisible Joker"),
+            anteRange = 4..14,
+            count = 6,
+            slotRange = 1..150,
+            slotPriority = 5,
+            sources = Src.SHOP_OR_PACK
+        )
     )
 
     val detail = Detail.forItems(
@@ -511,6 +614,31 @@ suspend fun main() {
     }
 
     if (USE_GPU && ClSearch.supports(detail, conditions)) {
+
+        // Ctrl-C, SIGTERM, or the machine going down mid-run. Without this the results
+        // only ever exist in memory and hours of searching evaporate.
+        val lastProgress = java.util.concurrent.atomic.AtomicLong(startIndex)
+        val lastSearched = java.util.concurrent.atomic.AtomicLong(0)
+        Runtime.getRuntime().addShutdownHook(Thread {
+            if (finished.get()) return@Thread
+            println()
+            checkpoint(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
+                lastSearched.get(), lastProgress.get(), "interrupted")
+        })
+
+        var nextCheckpointAt = CHECKPOINT_EVERY_SEEDS
+        val progress: (Long, Long) -> Unit = { searched, resumeIndex ->
+            lastSearched.set(searched)
+            lastProgress.set(resumeIndex)
+            if (CHECKPOINT_EVERY_SEEDS > 0 && searched >= nextCheckpointAt) {
+                // Step past every boundary already crossed, so a chunk larger than the
+                // interval does not queue up a run of back-to-back checkpoints.
+                while (nextCheckpointAt <= searched) nextCheckpointAt += CHECKPOINT_EVERY_SEEDS
+                checkpoint(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
+                    searched, resumeIndex, "checkpoint")
+            }
+        }
+
         try {
             // --- calibration ---
             if (CALIBRATION_SEEDS > 0 && CALIBRATION_ROUNDS > 0) {
@@ -537,11 +665,13 @@ suspend fun main() {
                 if (USE_ALL_GPUS) {
                     ClSearch.runMulti(
                         conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                        startIndex, seedsToCount, cutoffOf = { cutoff }, onHit = onHit)
+                        startIndex, seedsToCount, cutoffOf = { cutoff },
+                        onChunk = progress, onHit = onHit)
                 } else {
                     ClSearch.run(
                         conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                        startIndex, seedsToCount, cutoffOf = { cutoff }, onHit = onHit)
+                        startIndex, seedsToCount, cutoffOf = { cutoff },
+                        onChunk = progress, onHit = onHit)
                 }
             }
             gpuRun { index, score ->
@@ -550,7 +680,10 @@ suspend fun main() {
                 record(seedForIndex(index), score)
             }
             Stats.seeds.addAndFetch(seedsToCount)
-            hydrate(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers)
+            hydrate(snapshotResults(), conditions, detail, maxSearchAnte, shopItems, ignoredVouchers)
+            checkpoint(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
+                seedsToCount, startIndex + seedsToCount, "final")
+            finished.set(true)
             printResults(shopItems, start)
             return
         } catch (e: ClSearch.Unsupported) {
@@ -596,7 +729,10 @@ suspend fun main() {
         monitor.cancel()
     }).join()
 
-    hydrate(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers)
+    hydrate(snapshotResults(), conditions, detail, maxSearchAnte, shopItems, ignoredVouchers)
+    checkpoint(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
+        Stats.seeds.load(), endIndex, "final")
+    finished.set(true)
     printResults(shopItems, start)
 }
 
