@@ -336,11 +336,20 @@ class RngCache {
     private fun advance(current: Double): Double =
         round13(frac(current * 1.72431234 + 2.134453429141))
 
+    /**
+     * Work counters, never reset by [reset]. SearchPlanner reads them to estimate what a
+     * prefilter stage costs; a field increment per draw is noise next to the draw itself.
+     */
+    var draws = 0L
+    var inits = 0L
+
     fun nodeValue(family: Int, source: Int, ante: Int, resample: Int): Double {
+        draws++
         if (resample < RngKeys.MAX_RESAMPLE && ante <= RngKeys.MAX_ANTE) {
             val id = RngKeys.streamId(family, source, ante, resample)
             var s = state[id]
             if (s.isNaN()) {
+                inits++
                 s = hashKey(RngKeys.key(id))
                 touched[touchedCount++] = id
             }

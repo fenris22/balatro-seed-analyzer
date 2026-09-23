@@ -334,6 +334,10 @@ class SeedAnalyzer(
         resetState()
     }
 
+    /** Cumulative RNG work, read by SearchPlanner to cost prefilter stages. */
+    val rngDraws: Long get() = rng.draws
+    val rngInits: Long get() = rng.inits
+
     /** True when the last scanned seed could not be resolved; its results are meaningless. */
     val aborted: Boolean get() = resampleOverflow
 

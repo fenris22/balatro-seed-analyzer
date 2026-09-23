@@ -359,6 +359,30 @@ class MatchState(val conditions: Array<Condition>) {
     }
 
     /**
+     * True if some unmet condition could still accept a shop card at [slot] of [ante] or
+     * later in this ante's shop.
+     *
+     * When false, the rest of this shop cannot change the outcome, so it is not generated.
+     * This is exact, not a heuristic: shop cards draw only from the shop's own per-ante
+     * streams (cdt, rarity/Joker/edi "sho", Tarotsho), which nothing else reads, so
+     * skipping them moves no other draw. Slot ceilings only fall as the slot rises, so
+     * once this is false for a slot it stays false for the rest of the shop.
+     *
+     * It does not depend on the cutoff, so it also applies to verification scans.
+     */
+    fun shopCanMatch(ante: Int, slot: Int): Boolean {
+        for (i in 0 until n) {
+            if (found[i] >= need[i]) continue
+            val c = conditions[i]
+            if (c.sources and Src.SHOP == 0) continue
+            if (ante < c.anteMin || ante > c.anteMax) continue
+            if (slot > c.slotMax) continue
+            return true
+        }
+        return false
+    }
+
+    /**
      * Upper bound on the final total, assuming the scan has reached shop slot [slot] of
      * [ante] and nothing further has matched yet.
      *

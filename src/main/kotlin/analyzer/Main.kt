@@ -14,14 +14,14 @@ import kotlin.time.Duration.Companion.milliseconds
 // Tunables
 // ---------------------------------------------------------------------------
 
-/** Only the best MAX_RESULTS seeds are retained, so memory stays flat over a long run. */
-const val MAX_RESULTS = 200
+/**
+ * Only the best this-many seeds are retained, so memory stays flat over a long run.
+ * Set from --max-results at startup; the default is in main().
+ */
+var maxResults = 200
 
 /** Seed indices claimed per atomic operation (CPU path). */
 const val SEED_BATCH = 512
-
-/** Use the OpenCL kernel when the conditions are within what it covers. */
-const val USE_GPU = true
 
 /**
  * Split the range across every fp64 GPU on the machine.
@@ -33,16 +33,6 @@ const val USE_ALL_GPUS = true
 
 // --- checkpointing ---
 
-/**
- * Write the current best seeds every this many seeds searched. 0 disables.
- *
- * A long search is worth interrupting -- results only exist in memory otherwise, and a
- * Ctrl-C or a machine reboot loses hours. Each checkpoint overwrites the file with the
- * full current top list, so the file is always complete rather than an append log to
- * reassemble.
- */
-const val CHECKPOINT_EVERY_SEEDS = 100_000_000L
-
 /** Where checkpoints are written. Overwritten each time, not appended. */
 const val RESULTS_FILE = "results.txt"
 
@@ -51,33 +41,29 @@ const val CHECKPOINT_PRINT_TOP = 5
 
 // --- threshold calibration ---
 
-/**
- * Seeds sampled before the real run to pick a starting cutoff.
- *
- * The cutoff is self-tuning either way: once MAX_RESULTS results are banked, it rises to
- * the weakest one retained and keeps rising. Calibration only buys the *start* of the run
- * -- without it the first few hundred million seeds are scanned with a cutoff of negative
- * infinity, which means no score pruning at all. With required conditions doing the heavy
- * filtering that matters less than it used to, so this is a modest win, not a critical one.
- */
-const val CALIBRATION_SEEDS = 4_000_000L
-
 /** How many times the calibration sample is repeated, to smooth out a lucky stretch. */
 const val CALIBRATION_ROUNDS = 2
 
 /**
- * How many results the projected run should produce. Set well above MAX_RESULTS: the
+ * How many results the projected run should produce. Set well above maxResults: the
  * heap discards the excess, and aiming too tight risks a cutoff that starves it.
  */
-const val CALIBRATION_TARGET_HITS = MAX_RESULTS * 20
+val calibrationTargetHits: Int get() = maxResults * 20
 
 // ---------------------------------------------------------------------------
 // Seeds
 // ---------------------------------------------------------------------------
 
-/** Same 34-character alphabet Util.nextSeed walks (no 0, no O). */
-private const val SEED_CHARS = "123456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
-private const val SEED_BASE = 34L
+
+/**
+ * Seed alphabet: 1-9 and A-Z, 35 characters. Generated seeds never contain 0 or O, but a
+ * hand-typed 0 becomes O in game, so seeds with O are reachable and are searched too.
+ *
+ * This is the only copy: ClSearch passes it to the kernel as a define, so host and device
+ * cannot disagree. Changing it moves every seed to a new index.
+ */
+const val SEED_CHARS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+const val SEED_BASE = 35L
 
 /**
  * Writes the n'th seed of the enumeration into [out], returning its length.
@@ -99,6 +85,17 @@ fun seedForIndex(index: Long, out: CharArray): Int {
         n /= SEED_BASE
     }
     return len
+}
+
+/** Inverse of [seedForIndex]. */
+fun indexForSeed(seed: String): Long {
+    val s = seed.uppercase()
+    var offset = 0L
+    var block = SEED_BASE
+    for (l in 1 until s.length) { offset += block; block *= SEED_BASE }
+    var n = 0L
+    for (i in s.indices) n = n * SEED_BASE + SEED_CHARS.indexOf(s[i])
+    return offset + n
 }
 
 fun seedForIndex(index: Long): String {
@@ -132,6 +129,9 @@ class MatchSink(
 ) : ScanSink() {
     override fun wantMoreShop(ante: Int, slot: Int): Boolean {
         if (state.isComplete) return false
+        // Nothing unmet can take a shop card from here on: the rest of the shop is dead
+        // weight. Exact, so it applies to verification scans too.
+        if (!state.shopCanMatch(ante, slot)) return false
         if (!prune) return true
         // The requirement kill first: it is cheaper than the bound and does not depend on
         // the cutoff being well tuned.
@@ -194,7 +194,7 @@ class SeedResult(val seed: String, val score: Double) {
  * rejects almost everything before reaching it -- so blocking briefly costs nothing.
  */
 private val resultsLock = java.util.concurrent.locks.ReentrantLock()
-private val topResults = java.util.PriorityQueue<SeedResult>(MAX_RESULTS + 1, compareBy { it.score })
+private val topResults = java.util.PriorityQueue<SeedResult>(compareBy { it.score })
 
 /**
  * Read once per shop slot, so it stays a plain volatile read rather than a lock.
@@ -228,7 +228,7 @@ fun record(seed: String, score: Double) {
     try {
         if (score <= cutoff) return
         topResults.add(SeedResult(seed, score))
-        if (topResults.size > MAX_RESULTS) {
+        if (topResults.size > maxResults) {
             topResults.poll()
             cutoff = topResults.peek().score
         }
@@ -240,7 +240,7 @@ fun record(seed: String, score: Double) {
 /**
  * Fills in match detail and full reports for the seeds that survived.
  *
- * Runs once, on at most MAX_RESULTS seeds, so it can afford to be as slow as it likes.
+ * Runs once, on at most maxResults seeds, so it can afford to be as slow as it likes.
  */
 private fun hydrate(
     results: List<SeedResult>,
@@ -296,7 +296,9 @@ class Worker(
     private val detail: Detail,
     private val ignoredVouchers: List<String>,
     private val shopItems: Int,
+    stages: List<PrefilterStage> = emptyList(),
 ) {
+    private val runners = stages.map { StageRunner(it, conditions, ignoredVouchers) }
     private val state = MatchState(conditions)
     private val sink = MatchSink(state, maxSearchAnte)
     private val analyzer = SeedAnalyzer(detail, ignoredVouchers)
@@ -313,6 +315,9 @@ class Worker(
         state.reset(detail = false)
         analyzer.reset(seedBuf, len)
         localSeeds++
+
+        // Cheap, exact prefilters first, most selective per unit of work first.
+        for (r in runners) if (!r.passes(seedBuf, len)) { localKilled++; return }
 
         for (ante in 1..maxSearchAnte) {
             localAntes++
@@ -384,7 +389,7 @@ fun checkpoint(
         }
 
         // Filling in match detail needs a CPU rescan per seed, so it happens here rather
-        // than on the hit path. At MAX_RESULTS seeds it is a blink.
+        // than on the hit path. At maxResults seeds it is a blink.
         hydrate(results, conditions, detail, maxSearchAnte, shopItems, ignoredVouchers)
 
         val text = buildString {
@@ -524,12 +529,51 @@ fun calibrateCutoff(scores: MutableList<Double>, sampled: Long, planned: Long, t
 // ---------------------------------------------------------------------------
 
 @OptIn(ExperimentalAtomicApi::class)
-suspend fun main() {
+suspend fun main(args: Array<String>) {
     val start = System.currentTimeMillis()
 
-    val shopItems = 50
-    val startIndex = 0L
-    val seedsToCount = 2_300_000_000_000L
+    // -----------------------------------------------------------------------
+    // Defaults. Every one of these can be overridden by a flag; run with --help
+    // for the list. Edit them here to change what a run with no flags does.
+    // -----------------------------------------------------------------------
+    val defaults = RunOptions(
+        maxResults = 200,                 // --max-results
+        useGpu = true,                    // --disable-gpu turns this off
+        startIndex = 0L,                  // --start-index
+        endIndex = 312_000_000L,          // --end-index
+        checkpointEvery = null,           // --checkpoint   (null = one tenth of the range)
+        calibrationSeeds = 4_000_000L,    // --calibration-seeds
+        globalSize = 4096,                // --global-size  (work items per compute unit)
+        localSize = 64,                   // --local-size
+        chunk = 4_000_000,                // --chunk        (seeds per GPU launch)
+    )
+
+    val opts = try {
+        Cli.parse(args, defaults) ?: return      // null: --help was shown
+    } catch (e: CliError) {
+        println("error: ${e.message}")
+        println("Run with --help to see every flag.")
+        kotlin.system.exitProcess(2)
+    }
+
+    maxResults = opts.maxResults
+    ClSearch.GLOBAL_SIZE = opts.globalSize
+    ClSearch.LOCAL_SIZE = opts.localSize.toLong()
+    ClSearch.CHUNK = opts.chunk
+    val useGpu = opts.useGpu
+    val startIndex = opts.startIndex
+    val seedsToCount = opts.seedsToCount
+    val checkpointEvery = opts.resolvedCheckpoint
+    val calibrationSeeds = opts.calibrationSeeds
+
+    println("Settings: seeds ${"%,d".format(startIndex)} to ${"%,d".format(opts.endIndex)} " +
+            "(${"%,d".format(seedsToCount)}), max results $maxResults, " +
+            (if (checkpointEvery > 0) "checkpoint every ${"%,d".format(checkpointEvery)}, " else "checkpoints off, ") +
+            "calibration ${"%,d".format(calibrationSeeds)}, " +
+            (if (useGpu) "GPU global ${opts.globalSize}/CU, local ${opts.localSize}, chunk ${"%,d".format(opts.chunk)}"
+            else "CPU only"))
+
+    val shopItems = 100
     val ignoredVouchers = listOf("Planet_Merchant", "Magic_Trick")
 
     // -----------------------------------------------------------------------
@@ -541,7 +585,6 @@ suspend fun main() {
     // -----------------------------------------------------------------------
     val conditions = arrayOf(
 
-        // A negative Perkeo from one of the first three Souls of the run.
         Condition(
             jokerFromDisplayName("Chicot"),
             required = true,
@@ -569,27 +612,7 @@ suspend fun main() {
             sources = Src.PACK,
         ),
 
-        Condition(
-            listOf(jokerFromDisplayName("Blueprint"),jokerFromDisplayName("Brainstorm")),
-            required = true,
-            anteRange = 3..6,
-            antePriority = 2,
-            editionTarget = editionFromDisplayName("Negative"),
-            editionPriority = 10,
-            slotRange = 1..50,
-            slotPriority = 5,
-            sources = Src.SHOP_OR_PACK
-        ),
-
-        Condition(
-            jokerFromDisplayName("Invisible Joker"),
-            anteRange = 4..14,
-            count = 6,
-            slotRange = 1..150,
-            slotPriority = 5,
-            sources = Src.SHOP_OR_PACK
         )
-    )
 
     val detail = Detail.forItems(
         conditions.flatMap { it.items },
@@ -602,6 +625,10 @@ suspend fun main() {
     println("Generating: $detail")
     warnUnsatisfiable(conditions)
 
+    // Orders the cheap pack/Soul-only requirement checks so the most selective per unit of
+    // work runs first. Sampled on the CPU; takes well under a second.
+    val stages = SearchPlanner.plan(conditions, ignoredVouchers, startIndex)
+
     Stats.nextIndex.store(startIndex)
     val endIndex = startIndex + seedsToCount
     val workerCount = Runtime.getRuntime().availableProcessors()
@@ -609,11 +636,11 @@ suspend fun main() {
     // -----------------------------------------------------------------------
     // GPU path
     // -----------------------------------------------------------------------
-    if (USE_GPU) ClSearch.whyUnsupported(detail, conditions)?.let {
+    if (useGpu) ClSearch.whyUnsupported(detail, conditions)?.let {
         println("GPU not used: $it. Running on the CPU, which produces identical results more slowly.")
     }
 
-    if (USE_GPU && ClSearch.supports(detail, conditions)) {
+    if (useGpu && ClSearch.supports(detail, conditions)) {
 
         // Ctrl-C, SIGTERM, or the machine going down mid-run. Without this the results
         // only ever exist in memory and hours of searching evaporate.
@@ -626,14 +653,14 @@ suspend fun main() {
                 lastSearched.get(), lastProgress.get(), "interrupted")
         })
 
-        var nextCheckpointAt = CHECKPOINT_EVERY_SEEDS
+        var nextCheckpointAt = checkpointEvery
         val progress: (Long, Long) -> Unit = { searched, resumeIndex ->
             lastSearched.set(searched)
             lastProgress.set(resumeIndex)
-            if (CHECKPOINT_EVERY_SEEDS > 0 && searched >= nextCheckpointAt) {
+            if (checkpointEvery > 0 && searched >= nextCheckpointAt) {
                 // Step past every boundary already crossed, so a chunk larger than the
                 // interval does not queue up a run of back-to-back checkpoints.
-                while (nextCheckpointAt <= searched) nextCheckpointAt += CHECKPOINT_EVERY_SEEDS
+                while (nextCheckpointAt <= searched) nextCheckpointAt += checkpointEvery
                 checkpoint(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
                     searched, resumeIndex, "checkpoint")
             }
@@ -641,7 +668,7 @@ suspend fun main() {
 
         try {
             // --- calibration ---
-            if (CALIBRATION_SEEDS > 0 && CALIBRATION_ROUNDS > 0) {
+            if (calibrationSeeds > 0 && CALIBRATION_ROUNDS > 0) {
                 val sample = ArrayList<Double>()
                 var sampled = 0L
                 for (round in 0 until CALIBRATION_ROUNDS) {
@@ -650,14 +677,15 @@ suspend fun main() {
                     val from = startIndex + (seedsToCount / CALIBRATION_ROUNDS) * round
                     ClSearch.run(
                         conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                        from, CALIBRATION_SEEDS,
+                        from, calibrationSeeds,
                         cutoffOf = { Double.NEGATIVE_INFINITY },
                         tolerateHitOverflow = true,
                         quiet = true,
+                        stages = stages,
                     ) { _, score -> sample.add(score) }
-                    sampled += CALIBRATION_SEEDS
+                    sampled += calibrationSeeds
                 }
-                cutoff = calibrateCutoff(sample, sampled, seedsToCount, CALIBRATION_TARGET_HITS)
+                cutoff = calibrateCutoff(sample, sampled, seedsToCount, calibrationTargetHits)
             }
 
             // --- the run ---
@@ -666,12 +694,12 @@ suspend fun main() {
                     ClSearch.runMulti(
                         conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
                         startIndex, seedsToCount, cutoffOf = { cutoff },
-                        onChunk = progress, onHit = onHit)
+                        stages = stages, onChunk = progress, onHit = onHit)
                 } else {
                     ClSearch.run(
                         conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
                         startIndex, seedsToCount, cutoffOf = { cutoff },
-                        onChunk = progress, onHit = onHit)
+                        stages = stages, onChunk = progress, onHit = onHit)
                 }
             }
             gpuRun { index, score ->
@@ -714,7 +742,7 @@ suspend fun main() {
 
         val workers = List(workerCount) {
             launch(Dispatchers.Default) {
-                val worker = Worker(conditions, maxSearchAnte, detail, ignoredVouchers, shopItems)
+                val worker = Worker(conditions, maxSearchAnte, detail, ignoredVouchers, shopItems, stages)
                 while (true) {
                     val from = Stats.nextIndex.fetchAndAdd(SEED_BATCH.toLong())
                     if (from >= endIndex) break

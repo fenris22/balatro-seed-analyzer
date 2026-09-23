@@ -30,9 +30,12 @@ object ClSearch {
      */
     const val MAX_LEN_SLOTS = 32
 
-    /** Work items per compute unit. The state buffer scales with this, nothing else. */
-    const val GLOBAL_SIZE = 8192
-    const val LOCAL_SIZE = 256L
+    /**
+     * Work items per compute unit. The state buffer scales with this, nothing else.
+     * Set from --global-size / --local-size before a run; the defaults are in main().
+     */
+    var GLOBAL_SIZE = 4096
+    var LOCAL_SIZE = 64L
 
     /**
      * Seeds per kernel launch.
@@ -42,8 +45,10 @@ object ClSearch {
      * host round-trip over more work, and there is no longer a ragged tail to pay for it.
      * Lower this only if you are on a GPU driving a display, where a launch over about two
      * seconds trips the watchdog and resets the driver.
+     *
+     * Set from --chunk before a run; the default is in main().
      */
-    const val CHUNK = 64_000_000
+    var CHUNK = 4_000_000
 
     /** Per-launch hit capacity. */
     const val MAX_HITS = 1 shl 18
@@ -65,6 +70,32 @@ object ClSearch {
     const val MAX_COUNT = 15
 
     private const val BUILD_OPTIONS = "-cl-std=CL1.2"
+
+    /**
+     * Register cap for Nvidia builds. 0 leaves it to the compiler.
+     *
+     * This is the lever that matters on Hopper. The pseudohash inner loop is a chain of
+     * FP64 divisions, each depending on the last, and an FP64 divide is an emulated
+     * multi-instruction sequence -- so a single chain is thousands of cycles that cannot
+     * be overlapped within one thread. The only way to fill them is many resident warps,
+     * and at the compiler's default register count this kernel gets very few: one block
+     * per SM is 8 warps out of a possible 64, which lines up with the ~2%-of-peak
+     * throughput and the quarter-of-budget power draw.
+     *
+     * Capping registers forces more blocks resident. It trades spills for occupancy, so
+     * the right value is empirical -- sweep 64, 72, 96, 128 and watch seeds/s. AMD is left
+     * alone: CDNA occupancy is already good here and the flag is Nvidia-only anyway.
+     */
+    const val NV_MAX_REGISTERS = 0
+
+    /**
+     * Force every device function inline.
+     *
+     * Helps where a struct address would otherwise escape to local memory, hurts where the
+     * extra live values push registers up and cost occupancy. Which one wins is a property
+     * of the device and the compiler, so it is a switch rather than a decision.
+     */
+    const val FORCE_INLINE_DEVICE_FUNCS = true
 
     class Unsupported(msg: String) : Exception(msg)
 
@@ -137,6 +168,19 @@ object ClSearch {
 
     // --- reachable stream table ----------------------------------------------
 
+    /** Shop stream slots, matching SS_* in search.cl. */
+    private const val SHOP_STREAMS = 7
+    private const val SS_CDT = 0
+    private const val SS_RARITY = 1
+    private const val SS_JOKER1 = 2   // +1 uncommon, +2 rare
+    private const val SS_EDITION = 5
+    private const val SS_TAROT = 6
+
+    /** Stage content flags, matching ST_* in search.cl. */
+    private fun stageFlags(d: Detail): Int =
+        (if (d.jokers) 1 else 0) or (if (d.editions) 2 else 0) or (if (d.souls) 4 else 0) or
+                (if (d.soulJokers) 8 else 0) or (if (d.tarots) 16 else 0) or (if (d.spectrals) 32 else 0)
+
     /**
      * Enumerates every (family, source, ante, resample) the kernel can reach and compacts
      * it. The cartesian id space is 41k entries; the reachable set for a joker search is a
@@ -162,6 +206,7 @@ object ClSearch {
          * in the remap, flags the seed, and the host redoes it exactly on the CPU.
          */
         private fun add(f: Int, s: Int, a: Int, maxResample: Int = 1) {
+            check(!sealed) { "state streams must all be added before the shop region" }
             for (r in 0 until maxResample) {
                 val id = RngKeys.streamId(f, s, a, r)
                 if (remap[id] >= 0) continue
@@ -181,28 +226,36 @@ object ClSearch {
          */
         val anteEnd = IntArray(maxAnte + 1)
 
+        /** Streams that live in the global state buffer. Everything past this is a register. */
+        var stateCount = 0
+            private set
+        private var sealed = false
+
+        /**
+         * Compact id of each shop stream, [ante * SHOP_STREAMS + SS_*], or -1 if not generated.
+         *
+         * Shop streams are only ever read inside one ante's shop loop, so the kernel keeps
+         * them in private registers for that loop instead of in the global state buffer.
+         * They still get compact ids, because the key-byte table is indexed by them, but
+         * they are left out of remap: a global draw can never reach them by accident.
+         */
+        val shopCid = IntArray((maxAnte + 1) * SHOP_STREAMS) { -1 }
+
         init {
             val packDedup = 8
             for (a in 1..maxAnte) {
                 add(RngKeys.VOUCHER, 0, a, RngKeys.MAX_RESAMPLE)
-                add(RngKeys.CDT, 0, a)
                 add(RngKeys.SHOP_PACK, 0, a)
 
-                // Shop jokers are never deduplicated; Buffoon-pack jokers are.
-                add(RngKeys.RARITY, RngKeys.SRC_SHO, a)
+                // Buffoon-pack jokers are deduplicated, hence the resample slots.
                 add(RngKeys.RARITY, RngKeys.SRC_BUF, a)
-                if (wantEditions) {
-                    add(RngKeys.EDITION, RngKeys.SRC_SHO, a)
-                    add(RngKeys.EDITION, RngKeys.SRC_BUF, a)
-                }
+                if (wantEditions) add(RngKeys.EDITION, RngKeys.SRC_BUF, a)
                 for (fam in intArrayOf(RngKeys.JOKER1, RngKeys.JOKER2, RngKeys.JOKER3)) {
-                    add(fam, RngKeys.SRC_SHO, a)
                     add(fam, RngKeys.SRC_BUF, a, packDedup)
                 }
 
                 if (wantTarots) {
                     add(RngKeys.TAROT, RngKeys.SRC_AR1, a, packDedup)
-                    add(RngKeys.TAROT, RngKeys.SRC_SHO, a)
                     add(RngKeys.SOUL_TAROT, 0, a)
                 }
                 if (wantSpectrals) {
@@ -222,6 +275,25 @@ object ClSearch {
             // Streams with no ante of their own (the Soul's legendary queue) live past the
             // last ante's slice and are cleared once per seed.
             if (wantSouls) add(RngKeys.JOKER4, 0, 0, packDedup)
+            stateCount = ids.size
+            sealed = true
+
+            // Register-resident shop streams. Shop jokers are never deduplicated and shop
+            // tarots never resample, so each needs exactly one slot.
+            for (a in 1..maxAnte) {
+                fun shop(k: Int, f: Int, src: Int) {
+                    shopCid[a * SHOP_STREAMS + k] = ids.size
+                    ids.add(RngKeys.streamId(f, src, a, 0))
+                    keys.add(RngKeys.keyFor(f, src, a, 0))
+                }
+                shop(SS_CDT, RngKeys.CDT, 0)
+                shop(SS_RARITY, RngKeys.RARITY, RngKeys.SRC_SHO)
+                shop(SS_JOKER1, RngKeys.JOKER1, RngKeys.SRC_SHO)
+                shop(SS_JOKER1 + 1, RngKeys.JOKER2, RngKeys.SRC_SHO)
+                shop(SS_JOKER1 + 2, RngKeys.JOKER3, RngKeys.SRC_SHO)
+                if (wantEditions) shop(SS_EDITION, RngKeys.EDITION, RngKeys.SRC_SHO)
+                if (wantTarots) shop(SS_TAROT, RngKeys.TAROT, RngKeys.SRC_SHO)
+            }
         }
 
         /** Distinct key lengths actually in use; the kernel sizes its prefix cache to this. */
@@ -253,6 +325,32 @@ object ClSearch {
         return String(buf, 0, maxOf(0, buf.size - 1))
     }
 
+    /**
+     * "OpenCL 2.1 AMD-APP ..." -> 2. Both the platform and device version strings start
+     * with "OpenCL <major>.<minor>" by spec.
+     */
+    private fun majorVersion(version: String): Int =
+        Regex("""OpenCL (\d+)\.""").find(version)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+
+    /**
+     * Creates the command queue with the OpenCL 2.0+ call where it exists.
+     *
+     * clCreateCommandQueue was deprecated in OpenCL 2.0 in favour of
+     * clCreateCommandQueueWithProperties. The newer call is not there on a 1.2-only
+     * platform, and calling it there fails instead of warning, so the old one stays as the
+     * fallback. Both make the same plain in-order queue with no properties.
+     */
+    private fun createQueue(context: cl_context, platform: cl_platform_id, device: cl_device_id): cl_command_queue {
+        val platformMajor = majorVersion(platformInfo(platform, CL_PLATFORM_VERSION))
+        val deviceMajor = majorVersion(deviceInfo(device, CL_DEVICE_VERSION))
+        return if (platformMajor >= 2 && deviceMajor >= 2) {
+            clCreateCommandQueueWithProperties(context, device, cl_queue_properties(), null)
+        } else {
+            @Suppress("DEPRECATION")
+            clCreateCommandQueue(context, device, 0, null)
+        }
+    }
+
     private fun readComputeUnits(device: cl_device_id): Int {
         val cus = IntArray(1)
         clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, 4L, Pointer.to(cus), null)
@@ -275,7 +373,14 @@ object ClSearch {
         val mult = LongArray(1)
         clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
             Sizeof.size_t.toLong(), Pointer.to(mult), null)
-        println("scratch/work-item: ${priv[0]} B | LDS/group: ${local[0]} B | preferred wg multiple: ${mult[0]}")
+        // maxWorkGroupSize is the register-limited ceiling for this kernel on this device.
+        // A low number means each thread is holding a lot of registers, which caps how many
+        // warps can be resident -- and with a latency-bound kernel that is the whole game.
+        val maxWg = LongArray(1)
+        clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE,
+            Sizeof.size_t.toLong(), Pointer.to(maxWg), null)
+        println("scratch/work-item: ${priv[0]} B | LDS/group: ${local[0]} B | " +
+                "preferred wg multiple: ${mult[0]} | max wg size: ${maxWg[0]}")
     }
 
     /**
@@ -334,11 +439,13 @@ object ClSearch {
         return best
     }
 
-    private fun platformName(p: cl_platform_id): String {
+    private fun platformName(p: cl_platform_id): String = platformInfo(p, CL_PLATFORM_NAME)
+
+    private fun platformInfo(p: cl_platform_id, param: Int): String {
         val size = LongArray(1)
-        clGetPlatformInfo(p, CL_PLATFORM_NAME, 0, null, size)
+        clGetPlatformInfo(p, param, 0, null, size)
         val buf = ByteArray(size[0].toInt())
-        clGetPlatformInfo(p, CL_PLATFORM_NAME, buf.size.toLong(), Pointer.to(buf), null)
+        clGetPlatformInfo(p, param, buf.size.toLong(), Pointer.to(buf), null)
         return String(buf, 0, maxOf(0, buf.size - 1)).trim()
     }
 
@@ -356,6 +463,9 @@ object ClSearch {
         maxSearchAnte: Int,
         shopItems: Int,
         streams: Streams,
+        useLocalPrefix: Boolean,
+        stages: List<PrefilterStage>,
+        globalSize: Long,
     ): String = buildString {
         fun d(name: String, value: Any) = appendLine("#define $name $value")
         d("NUM_CONDS", conditions.size)
@@ -374,9 +484,21 @@ object ClSearch {
         d("POOL_N_LEGENDARY", PoolArr.LEGENDARY_JOKERS.size)
         d("MAX_RESAMPLE", RngKeys.MAX_RESAMPLE)
         d("MAX_KEY_LEN", MAX_KEY_LEN)
+        // The seed alphabet, from Main.kt's SEED_CHARS, so the kernel's seedForIndex always
+        // matches the host's.
+        d("SEED_BASE", "${SEED_BASE}UL")
+        d("SEED_ALPHABET_INIT", SEED_CHARS.map { "'$it'" }.joinToString(",", "{", "}"))
         // The real count, not the ceiling: this sizes a dynamically indexed private array,
         // so every unused slot is scratch reserved for every resident work item.
         d("MAX_LEN_SLOTS", streams.lenSlotCount)
+        d("WG_SIZE", LOCAL_SIZE)
+        // Shared memory for the prefix cache only where there is enough of it. An H100 SM
+        // has 228 KB and hosts several groups happily; a CDNA3 compute unit has 64 KB
+        // total, so a 256-thread group would take half of it and collapse occupancy. AMD's
+        // compiler also handles the private array better than Nvidia's does.
+        val localPrefix = if (useLocalPrefix) 1 else 0
+        d("USE_LOCAL_PREFIX", localPrefix)
+        d("FORCE_INLINE_ON", if (FORCE_INLINE_DEVICE_FUNCS) 1 else 0)
         d("WANT_JOKERS", if (detail.jokers) 1 else 0)
         d("WANT_EDITIONS", if (detail.editions) 1 else 0)
         d("WANT_TAROTS", if (detail.tarots) 1 else 0)
@@ -394,7 +516,27 @@ object ClSearch {
         d("V_PLANET_TYCOON", PoolArr.V_PLANET_TYCOON)
         d("V_PLANET_MERCHANT", PoolArr.V_PLANET_MERCHANT)
         d("V_MAGIC_TRICK", PoolArr.V_MAGIC_TRICK)
-        appendLine("// ${streams.ids.size} reachable streams")
+
+        // Register-resident shop streams (#3).
+        d("NUM_SHOP_STREAMS", SHOP_STREAMS)
+        d("SHOP_CID_INIT", streams.shopCid.joinToString(",", "{", "}"))
+
+        // Prefilter stages (#5), in the order SearchPlanner chose.
+        require(stages.size <= SearchPlanner.MAX_STAGES) { "too many prefilter stages" }
+        d("NUM_STAGES", stages.size)
+        if (stages.isNotEmpty()) {
+            d("STAGE_MAX_ANTE_INIT", stages.joinToString(",", "{", "}") { it.maxAnte.toString() })
+            d("STAGE_FLAGS_INIT", stages.joinToString(",", "{", "}") {
+                stageFlags(SearchPlanner.clampTo(it, detail)).toString()
+            })
+            d("STAGE_MASK_INIT", stages.joinToString(",", "{", "}") { st ->
+                var mask = 0
+                for (i in st.condIndex) mask = mask or (1 shl i)
+                "${mask}u"
+            })
+        }
+
+        appendLine("// ${streams.ids.size} streams, ${streams.stateCount} in the state buffer")
     }
 
     /**
@@ -476,6 +618,8 @@ object ClSearch {
         dispenser: SeedDispenser? = null,
         /** Called after every chunk with (seeds searched so far, safe resume index). */
         onChunk: ((Long, Long) -> Unit)? = null,
+        /** Prefilter stages from SearchPlanner.plan, already in run order. */
+        stages: List<PrefilterStage> = emptyList(),
         onHit: (Long, Double) -> Unit,
     ) {
         whyUnsupported(detail, conditions)?.let { throw Unsupported(it) }
@@ -490,13 +634,15 @@ object ClSearch {
 
         if (!quiet) {
             println("${label}GPU: ${deviceInfo(device, CL_DEVICE_NAME).trim()} (${maxComputeUnits} CUs)")
-            println("Streams: $nStreams, prefix slots ${streams.lenSlotCount}, " +
-                    "state buffer ${nStreams.toLong() * globalSize * 8 / (1 shl 20)} MB")
+            println("Streams: $nStreams (${streams.stateCount} in memory, " +
+                    "${nStreams - streams.stateCount} shop streams in registers), " +
+                    "prefix slots ${streams.lenSlotCount}, " +
+                    "state buffer ${streams.stateCount.toLong() * globalSize * 8 / (1 shl 20)} MB")
         }
 
         val props = cl_context_properties().apply { addProperty(CL_CONTEXT_PLATFORM.toLong(), platform) }
         val context = clCreateContext(props, 1, arrayOf(device), null, null, null)
-        val queue = clCreateCommandQueue(context, device, 0, null)
+        val queue = createQueue(context, platform, device)
 
         // --- constant tables ---
         val keyChars = ByteArray(nStreams * MAX_KEY_LEN)
@@ -578,8 +724,9 @@ object ClSearch {
         args.add(keep(roInts(streams.remap)))
         args.add(keep(roInts(streams.anteEnd)))
 
+        // Only the memory-resident streams need space; shop streams live in registers.
         val bState = keep(clCreateBuffer(context, CL_MEM_READ_WRITE,
-            nStreams.toLong() * globalSize * Sizeof.cl_double, null, null))
+            maxOf(1, streams.stateCount).toLong() * globalSize * Sizeof.cl_double, null, null))
         val bHitIndex = keep(clCreateBuffer(context, CL_MEM_READ_WRITE,
             (MAX_HITS * Sizeof.cl_int).toLong(), null, null))
         val bHitScore = keep(clCreateBuffer(context, CL_MEM_READ_WRITE,
@@ -594,10 +741,28 @@ object ClSearch {
         args.add(bState); args.add(bHitIndex); args.add(bHitScore); args.add(bHitCount)
         args.add(bOverflow); args.add(bWork)
 
-        val source = buildDefines(conditions, detail, maxSearchAnte, shopItems, streams) + "\n" + loadSource()
+        // Nvidia demotes the dynamically indexed prefix cache to per-thread local memory
+        // whatever the inlining, so it goes to shared memory there. AMD keeps it private.
+        val vendor = deviceInfo(device, CL_DEVICE_VENDOR).lowercase()
+        val useLocalPrefix = vendor.contains("nvidia")
+        val ldsBytes = LOCAL_SIZE * (streams.lenSlotCount or 1) * 8
+        if (!quiet) {
+            println("Prefix cache: ${if (useLocalPrefix) "__local (${ldsBytes / 1024} KB/group)" else "private"} " +
+                    "($vendor)")
+        }
+
+        val source = buildDefines(conditions, detail, maxSearchAnte, shopItems, streams, useLocalPrefix,
+            stages, globalSize) +
+                "\n" + loadSource()
+        val buildOptions = buildString {
+            append(BUILD_OPTIONS)
+            if (useLocalPrefix && NV_MAX_REGISTERS > 0) append(" -cl-nv-maxrregcount=$NV_MAX_REGISTERS")
+        }
+        if (!quiet) println("Build options: $buildOptions")
+
         val program = clCreateProgramWithSource(context, 1, arrayOf(source), null, null)
         try {
-            clBuildProgram(program, 0, null, BUILD_OPTIONS, null, null)
+            clBuildProgram(program, 0, null, buildOptions, null, null)
         } catch (e: CLException) {
             val size = LongArray(1)
             clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, null, size)
@@ -663,7 +828,8 @@ object ClSearch {
             for (b in args) clSetKernelArg(kernel, a++, Sizeof.cl_mem.toLong(), Pointer.to(b))
             clSetKernelArg(kernel, a++, Sizeof.cl_ulong.toLong(), Pointer.to(longArrayOf(base)))
             clSetKernelArg(kernel, a++, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(chunk)))
-            clSetKernelArg(kernel, a++, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(nStreams)))
+            // The kernel clears streams up to this count; shop streams are not in the buffer.
+            clSetKernelArg(kernel, a++, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(streams.stateCount)))
             clSetKernelArg(kernel, a++, Sizeof.cl_double.toLong(), Pointer.to(doubleArrayOf(cutoffOf())))
             clSetKernelArg(kernel, a, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(MAX_HITS)))
 
@@ -881,6 +1047,7 @@ object ClSearch {
         cutoffOf: () -> Double,
         devices: List<Pair<cl_platform_id, cl_device_id>>? = null,
         onChunk: ((Long, Long) -> Unit)? = null,
+        stages: List<PrefilterStage> = emptyList(),
         onHit: (Long, Double) -> Unit,
     ) {
         println("Scanning for GPUs:")
@@ -889,7 +1056,7 @@ object ClSearch {
 
         if (found.size == 1) {
             run(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                startIndex, seedCount, cutoffOf, onChunk = onChunk, onHit = onHit)
+                startIndex, seedCount, cutoffOf, onChunk = onChunk, stages = stages, onHit = onHit)
             return
         }
 
@@ -911,7 +1078,8 @@ object ClSearch {
                 try {
                     run(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
                         startIndex, seedCount, cutoffOf, deviceOverride = dev, label = "[gpu$i] ",
-                        puntSink = punts, dispenser = work, onChunk = onChunk, onHit = onHit)
+                        puntSink = punts, dispenser = work, onChunk = onChunk, stages = stages,
+                        onHit = onHit)
                 } catch (t: Throwable) {
                     failures.add(t)
                     println("[gpu$i] FAILED: ${t.message}")

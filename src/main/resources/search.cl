@@ -18,6 +18,41 @@
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #pragma OPENCL FP_CONTRACT OFF
 
+// `inline` is only a hint, and it matters more than usual here: the Rng struct is passed
+// by pointer to every draw, so if a call is left out of line the struct's address escapes
+// and the whole thing -- including the dynamically indexed prefix cache -- is demoted to
+// per-thread local memory. On Nvidia that turns every field access into a memory round
+// trip, which shows up as full "utilization" at a quarter of the power budget.
+#if FORCE_INLINE_ON
+#define FORCE_INLINE __attribute__((always_inline)) inline
+#else
+#define FORCE_INLINE inline
+#endif
+
+/*
+ * Where the per-work-item prefix cache lives.
+ *
+ * It is indexed by a value only known at runtime, and a dynamically indexed private array
+ * is not a register file -- it is per-thread global memory (scratch on AMD, local on
+ * Nvidia). At MAX_LEN_SLOTS doubles that was the bulk of this kernel's scratch, and every
+ * hit on it was a memory round trip.
+ *
+ * Shared memory fixes that, but only where there is enough of it: an H100 SM has 228 KB
+ * and can host several groups, while a CDNA3 compute unit has 64 KB total, so a 256-thread
+ * group would monopolise it and collapse occupancy. The host therefore picks per vendor --
+ * see ClSearch.buildDefines -- and USE_LOCAL_PREFIX 0 keeps the old private array.
+ *
+ * The stride is forced odd so consecutive work items land on different shared-memory
+ * banks; an even stride would serialise a whole warp's accesses.
+ */
+#define PREFIX_STRIDE (MAX_LEN_SLOTS | 1)
+
+#if USE_LOCAL_PREFIX
+#define PREFIX_SPACE __local
+#else
+#define PREFIX_SPACE
+#endif
+
 #define PI_D 3.14159265358979323846
 #define E_D  2.7182818284590452354
 #define PSEUDOHASH_K 1.1239285023
@@ -76,12 +111,12 @@
 #define SB_SOUL 4
 
 __constant double DECAY[5] = { 10.0, 6.0, 3.0, 2.0, 1.0 };
-inline double decay_at(int d) { return (d < 5) ? DECAY[d] : 0.0; }
+FORCE_INLINE double decay_at(int d) { return (d < 5) ? DECAY[d] : 0.0; }
 
-inline double frac_d(double x) { return x - floor(x); }
-inline double round13(double x) { return floor(x * 1e13 + 0.5) / 1e13; }
+FORCE_INLINE double frac_d(double x) { return x - floor(x); }
+FORCE_INLINE double round13(double x) { return floor(x * 1e13 + 0.5) / 1e13; }
 
-inline double lua_draw(double d0) {
+FORCE_INLINE double lua_draw(double d0) {
     double d = d0;
     ulong u;
     d = d * PI_D; d = d + E_D; u = as_ulong(d);
@@ -107,24 +142,22 @@ inline double lua_draw(double d0) {
 
 // --- seed handling -----------------------------------------------------------
 
-__constant uchar SEED_ALPHABET[34] = {
-    '1','2','3','4','5','6','7','8','9',
-    'A','B','C','D','E','F','G','H','I','J','K','L','M','N','P','Q','R','S','T','U','V','W','X','Y','Z'
-};
+// From Main.kt's SEED_CHARS via the host defines, so host and device always agree.
+__constant uchar SEED_ALPHABET[SEED_BASE] = SEED_ALPHABET_INIT;
 
 // Packed into two ulongs rather than a uchar[16]. A dynamically indexed private array is
 // scratch -- device memory -- and the seed is read once per character on every stream
 // initialisation, so it was among the hottest things living there.
-inline int seed_for_index(ulong index, ulong *lo, ulong *hi) {
+FORCE_INLINE int seed_for_index(ulong index, ulong *lo, ulong *hi) {
     ulong n = index;
     int len = 1;
-    ulong block = 34UL;
-    while (n >= block) { n -= block; len++; block *= 34UL; }
+    ulong block = SEED_BASE;
+    while (n >= block) { n -= block; len++; block *= SEED_BASE; }
     ulong l = 0UL, h = 0UL;
     for (int i = len - 1; i >= 0; i--) {
-        ulong ch = (ulong)SEED_ALPHABET[n % 34UL];
+        ulong ch = (ulong)SEED_ALPHABET[n % SEED_BASE];
         if (i < 8) l |= ch << (8 * i); else h |= ch << (8 * (i - 8));
-        n /= 34UL;
+        n /= SEED_BASE;
     }
     *lo = l; *hi = h;
     return len;
@@ -133,31 +166,22 @@ inline int seed_for_index(ulong index, ulong *lo, ulong *hi) {
 // --- rng context -------------------------------------------------------------
 
 typedef struct {
-    __global double *state;      // [compactStream * gsize + gid]
+    __global double *state;      // [compactStream * gsize + gid], memory-resident streams only
     __global const int *remap;   // cartesian stream id -> compact index, -1 if absent
     int gsize;
     int gid;
     ulong seedLo, seedHi;
     int seedLen;
     double hashedSeed;
-    double prefix[MAX_LEN_SLOTS];
     uint havePrefix;             // bitmask over the prefix slots
     int overflow;                // set when the device cannot answer; host redoes the seed
 } Rng;
 
-inline uint seed_char(const Rng *g, int i) {
+FORCE_INLINE uint seed_char(const Rng *g, int i) {
     return (uint)((i < 8 ? (g->seedLo >> (8 * i)) : (g->seedHi >> (8 * (i - 8)))) & 0xFFUL);
 }
 
-inline double self_hash(const Rng *g) {
-    double num = 1.0;
-    for (int i = g->seedLen - 1; i >= 0; i--) {
-        num = frac_d(PSEUDOHASH_K / num * (double)seed_char(g, i) * PI_D + PI_D * (double)(i + 1));
-    }
-    return num;
-}
-
-inline double seed_prefix(const Rng *g, int keyLen) {
+FORCE_INLINE double seed_prefix(const Rng *g, int keyLen) {
     double num = 1.0;
     for (int i = g->seedLen - 1; i >= 0; i--) {
         num = frac_d(PSEUDOHASH_K / num * (double)seed_char(g, i) * PI_D + PI_D * (double)(keyLen + i + 1));
@@ -165,11 +189,39 @@ inline double seed_prefix(const Rng *g, int keyLen) {
     return num;
 }
 
-inline int stream_id(int f, int s, int a, int r) {
+FORCE_INLINE int stream_id(int f, int s, int a, int r) {
     return ((f * SOURCE_COUNT + s) << 8) | (a << 4) | r;
 }
 
-inline double rnd(Rng *g,
+// First-touch value of a stream: pseudohash(key, seed), with the seed half cached.
+FORCE_INLINE double init_stream(Rng *g,
+                                PREFIX_SPACE double *prefix,
+                                __constant const uchar *keyChars,
+                                __constant const uchar *keyLens,
+                                __constant const uchar *keySlots,
+                                int cid)
+{
+    const int keyLen = keyLens[cid];
+    const int slot = keySlots[cid];
+    double startv;
+    if (g->havePrefix & (1u << slot)) startv = prefix[slot];
+    else {
+        startv = seed_prefix(g, keyLen);
+        prefix[slot] = startv;
+        g->havePrefix |= (1u << slot);
+    }
+
+    __constant const uchar *k = keyChars + (size_t)cid * MAX_KEY_LEN;
+    double num = startv;
+    for (int i = keyLen - 1; i >= 0; i--) {
+        num = frac_d(PSEUDOHASH_K / num * (double)k[i] * PI_D + PI_D * (double)(i + 1));
+    }
+    return num;
+}
+
+// A draw on a memory-resident stream.
+FORCE_INLINE double rnd(Rng *g,
+                  PREFIX_SPACE double *prefix,
                   __constant const uchar *keyChars,
                   __constant const uchar *keyLens,
                   __constant const uchar *keySlots,
@@ -181,31 +233,75 @@ inline double rnd(Rng *g,
 
     const size_t addr = (size_t)cid * g->gsize + g->gid;
     double st = g->state[addr];
-    if (isnan(st)) {
-        const int keyLen = keyLens[cid];
-        const int slot = keySlots[cid];
-        double startv;
-        if (g->havePrefix & (1u << slot)) startv = g->prefix[slot];
-        else {
-            startv = seed_prefix(g, keyLen);
-            g->prefix[slot] = startv;
-            g->havePrefix |= (1u << slot);
-        }
-        __constant const uchar *k = keyChars + (size_t)cid * MAX_KEY_LEN;
-        double num = startv;
-        for (int i = keyLen - 1; i >= 0; i--) {
-            num = frac_d(PSEUDOHASH_K / num * (double)k[i] * PI_D + PI_D * (double)(i + 1));
-        }
-        st = num;
-    }
+    if (isnan(st)) st = init_stream(g, prefix, keyChars, keyLens, keySlots, cid);
     const double advanced = round13(frac_d(st * 1.72431234 + 2.134453429141));
     g->state[addr] = advanced;
     return lua_draw((advanced + g->hashedSeed) / 2.0);
 }
 
-#define RND(f, s, a, r) rnd(&g, keyChars, keyLens, keySlots, (f), (s), (a), (r))
+// A draw on a register-resident stream: *st is a private variable that starts as NaN.
+// Same arithmetic as rnd(), minus the global load and store.
+FORCE_INLINE double rnd_reg(Rng *g,
+                  PREFIX_SPACE double *prefix,
+                  __constant const uchar *keyChars,
+                  __constant const uchar *keyLens,
+                  __constant const uchar *keySlots,
+                  int cid, double *st)
+{
+    double s = *st;
+    if (isnan(s)) {
+        if (cid < 0) { g->overflow = 1; return 0.0; }
+        s = init_stream(g, prefix, keyChars, keyLens, keySlots, cid);
+    }
+    const double advanced = round13(frac_d(s * 1.72431234 + 2.134453429141));
+    *st = advanced;
+    return lua_draw((advanced + g->hashedSeed) / 2.0);
+}
 
-inline int rnd_index(double v, int bound) { return (int)(v * (double)bound); }
+#define RND(f, s, a, r) rnd(&g, prefix, keyChars, keyLens, keySlots, (f), (s), (a), (r))
+#define RNDR(cid, stp)  rnd_reg(&g, prefix, keyChars, keyLens, keySlots, (cid), (stp))
+
+FORCE_INLINE int rnd_index(double v, int bound) { return (int)(v * (double)bound); }
+
+// --- shop streams (register resident) ----------------------------------------
+//
+// SHOP_CID[ante * NUM_SHOP_STREAMS + SS_*] is the compact id of that ante's shop stream,
+// -1 if the search does not generate it. Must match ClSearch.Streams.
+
+#define SS_CDT 0
+#define SS_RARITY 1
+#define SS_JOKER1 2      // +1 uncommon (Joker2), +2 rare (Joker3)
+#define SS_EDITION 5
+#define SS_TAROT 6
+
+__constant int SHOP_CID[(MAX_SEARCH_ANTE + 1) * NUM_SHOP_STREAMS] = SHOP_CID_INIT;
+
+// --- passes: prefilter stages, then the full scan ----------------------------
+//
+// A pass generates some subset of the pack contents and counts some subset of the
+// conditions. Stages (from SearchPlanner) generate only what their conditions need, skip
+// the voucher and the shop, and only ever kill a seed. The full pass is the original scan.
+// All passes share one copy of the pack code, gated by these flags, so the kernel does not
+// grow a second copy of it.
+
+#define ST_JOKERS       1
+#define ST_EDITIONS     2
+#define ST_SOULS        4
+#define ST_SOUL_JOKERS  8
+#define ST_TAROTS       16
+#define ST_SPECTRALS    32
+
+#define FULL_FLAGS ((WANT_JOKERS ? ST_JOKERS : 0) | (WANT_EDITIONS ? ST_EDITIONS : 0) \
+                  | (WANT_SOULS ? ST_SOULS : 0) | (WANT_SOUL_JOKERS ? ST_SOUL_JOKERS : 0) \
+                  | (WANT_TAROTS ? ST_TAROTS : 0) | (WANT_SPECTRALS ? ST_SPECTRALS : 0))
+
+#define ALL_MASK ((1u << NUM_CONDS) - 1u)
+
+#if NUM_STAGES > 0
+__constant int  STAGE_MAX_ANTE[NUM_STAGES] = STAGE_MAX_ANTE_INIT;
+__constant int  STAGE_FLAGS[NUM_STAGES]    = STAGE_FLAGS_INIT;
+__constant uint STAGE_MASK[NUM_STAGES]     = STAGE_MASK_INIT;
+#endif
 
 // --- matching ----------------------------------------------------------------
 //
@@ -219,12 +315,12 @@ inline int rnd_index(double v, int bound) { return (int)(v * (double)bound); }
 
 typedef struct {
     ulong found;   // 4 bits per condition
-    int unmet;     // conditions not yet at their count
+    int unmet;     // conditions (in this pass's mask) not yet at their count
     int dead;      // a required condition's window closed unsatisfied
     double total;
 } Match;
 
-inline double score_at(__constant const int *slotTarget, __constant const int *slotPriority,
+FORCE_INLINE double score_at(__constant const int *slotTarget, __constant const int *slotPriority,
                        __constant const int *anteTarget, __constant const int *antePriority,
                        __constant const double *editionScore,
                        int i, int ante, int slot)
@@ -236,10 +332,7 @@ inline double score_at(__constant const int *slotTarget, __constant const int *s
     return s + a + editionScore[i];
 }
 
-// Best a single further match could score once the scan has reached `ante`. Zero once the
-// window has closed, which is what makes an unmet condition collapse the bound at exactly
-// the moment it becomes unsatisfiable.
-inline double best_per_match_from(__constant const int *anteMin, __constant const int *anteMax,
+FORCE_INLINE double best_per_match_from(__constant const int *anteMin, __constant const int *anteMax,
                                   __constant const int *anteTarget, __constant const int *antePriority,
                                   __constant const int *slotPriority,
                                   __constant const double *editionScore,
@@ -251,16 +344,16 @@ inline double best_per_match_from(__constant const int *anteMin, __constant cons
     return 10.0 * (double)slotPriority[i] + a + editionScore[i];
 }
 
-// Offer one card to every condition whose window accepts it.
+// Offer one card to every condition in this pass's mask whose window accepts it.
 //
-// No early break, unlike the old first-match-wins loop: a Negative Blueprint legitimately
-// counts toward both a "5 blueprints" condition and an "at least 1 negative" condition,
-// which is exactly what those two express when written together.
+// No early break: a Negative Blueprint legitimately counts toward both a "5 blueprints"
+// condition and an "at least 1 negative" condition.
 #define OFFER(code_, edition_, ante_, slot_, src_)                                 \
     do {                                                                           \
         const int _c = (code_); const int _e = (edition_);                         \
         const int _a = (ante_); const int _s = (slot_); const int _sb = (src_);    \
         for (int _i = 0; _i < NUM_CONDS; _i++) {                                   \
+            if (!((passMask >> _i) & 1u)) continue;                                \
             if (CNT(_i) >= condCount[_i]) continue;                                \
             if (!(condSources[_i] & _sb)) continue;                                \
             if (_a < condAnteMin[_i] || _a > condAnteMax[_i]) continue;            \
@@ -281,16 +374,7 @@ inline double best_per_match_from(__constant const int *anteMin, __constant cons
     } while (0)
 
 // Upper bound on the final total, given the scan has reached shop slot `slot_` of `ante_`.
-//
-// Two cases per outstanding condition: wait for a later ante, where slot 1 is available
-// again but the ante penalty is at least one step worse, or finish here, where the slot
-// penalty is already locked in. Taking the better of the two is what makes slot pruning
-// do nothing until the later antes are themselves hopeless -- and everything once they are.
-//
-// Deliberately loose in one respect: every outstanding match is charged the same best
-// score, ignoring that they must land in distinct slots. Tightening that buys little now
-// that the required-window kill carries the pruning, and a loose-but-correct bound never
-// drops a seed it should have kept.
+// Full pass only. See MatchState.upperBound for the reasoning.
 #define UPPER_BOUND(ante_, slot_, out_)                                            \
     do {                                                                           \
         double _b = m.total;                                                       \
@@ -318,12 +402,24 @@ inline double best_per_match_from(__constant const int *anteMin, __constant cons
         (out_) = _b;                                                               \
     } while (0)
 
+// True if some unmet condition can still take a shop card at `slot_` or later in this
+// ante's shop. When it is false the rest of the shop cannot change the result, so it is
+// not generated -- in particular a whole shop is skipped in any ante where no condition
+// accepts shop cards (#1). Mirrors MatchState.shopCanMatch on the host.
+#define SHOP_WANTED(ante_, slot_, out_)                                            \
+    do {                                                                           \
+        int _w = 0;                                                                \
+        for (int _i = 0; _i < NUM_CONDS; _i++) {                                   \
+            if (CNT(_i) >= condCount[_i]) continue;                                \
+            if (!(condSources[_i] & SB_SHOP)) continue;                            \
+            if ((ante_) < condAnteMin[_i] || (ante_) > condAnteMax[_i]) continue;  \
+            if ((slot_) > condSlotMax[_i]) continue;                               \
+            _w = 1; break;                                                         \
+        }                                                                          \
+        (out_) = _w;                                                               \
+    } while (0)
+
 // The slot-level requirement kill, valid only inside the shop loop.
-//
-// Packs are generated before the shop, so by the time we are here every pack and Soul this
-// ante had to offer has already been seen. A pack-only condition in its last allowed ante
-// is therefore dead the moment the shop starts, and a shop condition dies the moment the
-// slot passes its ceiling.
 #define CLOSE_SLOT(ante_, slot_)                                                   \
     do {                                                                           \
         for (int _i = 0; _i < NUM_CONDS; _i++) {                                   \
@@ -336,11 +432,13 @@ inline double best_per_match_from(__constant const int *anteMin, __constant cons
         }                                                                          \
     } while (0)
 
-// The decisive prune. No cutoff, no score arithmetic: the instant a required condition's
-// last allowed ante is behind us and it is still short, the seed cannot ever qualify.
+// The decisive prune, for the conditions in this pass's mask. No cutoff, no score
+// arithmetic: once a required condition's last allowed ante is behind us and it is still
+// short, the seed cannot ever qualify.
 #define CLOSE_ANTE(ante_)                                                          \
     do {                                                                           \
         for (int _i = 0; _i < NUM_CONDS; _i++) {                                   \
+            if (!((passMask >> _i) & 1u)) continue;                                \
             if (!condRequired[_i]) continue;                                       \
             if (CNT(_i) >= condCount[_i]) continue;                                \
             if ((ante_) + 1 > condAnteMax[_i]) { m.dead = 1; break; }              \
@@ -353,6 +451,7 @@ inline double best_per_match_from(__constant const int *anteMin, __constant cons
 #define SOUL_FOUND(ante_)                                                          \
     do {                                                                           \
         soulCount++;                                                               \
+        if (passFlags & ST_SOUL_JOKERS) {                                          \
         int _li = rnd_index(RND(F_JOKER4, 0, 0, 0), POOL_N_LEGENDARY);             \
         int _ln = 0;                                                               \
         while (legendaryTaken & (1u << _li)) {                                     \
@@ -363,23 +462,23 @@ inline double best_per_match_from(__constant const int *anteMin, __constant cons
         if (!g.overflow) {                                                         \
             legendaryTaken |= (1u << _li);                                         \
             int _sed = 0;                                                          \
-            if (WANT_EDITIONS) {                                                   \
+            if (WANT_EDITIONS && (passFlags & ST_EDITIONS)) {                      \
                 const double _ev = RND(F_EDITION, SRC_SOU, (ante_), 0);            \
                 _sed = (_ev > 0.997) ? 4 : ((_ev > 0.994) ? 3                      \
                      : ((_ev > 0.98) ? 2 : ((_ev > 0.96) ? 1 : 0)));               \
             }                                                                      \
             OFFER(ITEM_CODE(R_LEGENDARY, _li), _sed, (ante_), soulCount, SB_SOUL); \
         }                                                                          \
+        }                                                                          \
     } while (0)
 #else
 #define SOUL_FOUND(ante_) do { } while (0)
 #endif
 
-// A Spectral pack slot: the two substitution rolls first (Black Hole wins when both hit),
-// and only if neither fires does the slot draw an actual spectral. RETRY entries in the
-// pool are re-rolled, which is why the host ships their positions as a bitmask.
-#if WANT_SPECTRALS
-#define SCAN_SPECTRAL_PACK(ante_, size_)                                           \
+// A Spectral pack slot with the spectral itself drawn: the two substitution rolls first
+// (Black Hole wins when both hit), and only if neither fires does the slot draw an actual
+// spectral. RETRY entries in the pool are re-rolled.
+#define SCAN_SPECTRAL_FULL(ante_, size_)                                           \
     do {                                                                           \
         int sex[8]; int nSex = 0;                                                  \
         for (int c = 0; c < (size_) && !g.overflow; c++) {                         \
@@ -403,10 +502,10 @@ inline double best_per_match_from(__constant const int *anteMin, __constant cons
             OFFER(SPECTRAL_BASE | idx, 0, (ante_), c + 1, SB_PACK);                \
         }                                                                          \
     } while (0)
-#elif WANT_SOULS
+
 // Souls-only: the substitution rolls are on their own stream, so the spectral choice
 // never has to be made.
-#define SCAN_SPECTRAL_PACK(ante_, size_)                                           \
+#define SCAN_SPECTRAL_SOULS(ante_, size_)                                          \
     do {                                                                           \
         for (int c = 0; c < (size_) && !g.overflow; c++) {                         \
             int isSoul = 0, isBH = 0;                                              \
@@ -416,9 +515,6 @@ inline double best_per_match_from(__constant const int *anteMin, __constant cons
             else if (isBH) { OFFER(CODE_BLACK_HOLE, 0, (ante_), c + 1, SB_PACK); } \
         }                                                                          \
     } while (0)
-#else
-#define SCAN_SPECTRAL_PACK(ante_, size_) do { } while (0)
-#endif
 
 // --- the kernel --------------------------------------------------------------
 
@@ -456,7 +552,7 @@ __kernel void search(
     __global uint           *workCounter,     // zeroed by the host before each launch
     const ulong baseIndex,
     const int chunkSize,
-    const int nStreams,
+    const int nStreams,                        // memory-resident streams only
     const double cutoff,
     const int maxHits)
 {
@@ -469,300 +565,364 @@ __kernel void search(
     g.gsize = gsize;
     g.gid = gid;
 
-    // Work is pulled from a shared counter rather than split by a fixed stride.
-    //
-    // Cost per seed is wildly uneven once required conditions are in play: most seeds die
-    // in ante 1 or 2 and a few survive to the last ante. A static split leaves a minority
-    // of work items grinding through survivors while the rest of the card drains, which
-    // shows up as occupancy sagging to roughly half and then to nothing at the tail of
-    // every launch. Grabbing SEED_GRAB seeds at a time keeps every compute unit fed until
-    // the chunk is genuinely finished.
-    //
-    // The state buffer is still indexed by gid, so it is sized by the launch width and the
-    // access pattern stays coalesced no matter which seeds a work item ends up with.
-    // One atomic per work GROUP, not per work item.
-    //
-    // A per-item grab puts every work item on the card onto a single global address. On a
-    // multi-die part those atomics cross the fabric and serialise, and with a couple of
-    // million work items that costs more than the imbalance it was fixing. Here one lane
-    // per group does the atomic and shares the result through local memory, which divides
-    // the atomic traffic by the group size.
-    //
-    // Every item in the group reads the same base, so the break below is uniform across
-    // the group and the barriers are never divergent.
-    #define GRAB_PER_GROUP 512
+    // With the cutoff still open the score bound can never prune (scores are >= 0), so the
+    // bound arithmetic is skipped entirely until calibration or results raise the bar.
+    const int useBound = (cutoff > -HUGE_VAL);
 
+    // Work is pulled from a shared counter, one atomic per work GROUP. See the history in
+    // the previous revision: per-item grabs serialise on multi-die parts.
+    //
+    // Each lane takes every lsz'th seed of the group's grab. The grab is at least one seed
+    // per lane, so a --local-size above 512 does not leave lanes idle.
     const uint lid = get_local_id(0);
     const uint lsz = get_local_size(0);
+    const uint grabPerGroup = max(512u, lsz);
+
     __local uint lBase;
 
+#if USE_LOCAL_PREFIX
+    __local double prefixPool[WG_SIZE * PREFIX_STRIDE];
+    __local double *prefix = prefixPool + lid * PREFIX_STRIDE;
+#else
+    double prefix[PREFIX_STRIDE];
+#endif
+
     for (;;) {
-        // Ensures everyone has read lBase from the previous round before it is overwritten.
         barrier(CLK_LOCAL_MEM_FENCE);
-        if (lid == 0) lBase = atomic_add(workCounter, GRAB_PER_GROUP);
+        if (lid == 0) lBase = atomic_add(workCounter, grabPerGroup);
         barrier(CLK_LOCAL_MEM_FENCE);
 
         const uint grabbed = lBase;
         if (grabbed >= (uint)chunkSize) break;
-        const uint grabEnd = min(grabbed + GRAB_PER_GROUP, (uint)chunkSize);
+        const uint grabEnd = min(grabbed + grabPerGroup, (uint)chunkSize);
 
     for (uint seedOff = grabbed + lid; seedOff < grabEnd; seedOff += lsz) {
 
-        // Only the streams with no ante of their own are cleared up front. Each ante's own
-        // slice is cleared as that ante starts, so a seed killed in ante 1 never pays to
-        // clear antes 2..N -- which with a high MAX_SEARCH_ANTE is most of the table.
-        for (int i = anteEnd[MAX_SEARCH_ANTE]; i < nStreams; i++) state[(size_t)i * gsize + gid] = NAN;
-        g.havePrefix = 0u;
-        g.overflow = 0;
         g.seedLen = seed_for_index(baseIndex + (ulong)seedOff, &g.seedLo, &g.seedHi);
-        g.hashedSeed = self_hash(&g);
+
+        g.havePrefix = 0u;
+        g.hashedSeed = seed_prefix(&g, 0);   // identical to pseudohash(seed)
+
 
         Match m;
-        m.found = 0UL;
-        m.unmet = NUM_CONDS;
-        m.dead = 0;
-        m.total = 0.0;
-
-        // Bitmask, not an array: NUM_VOUCHERS is under 64 and every access is by a
-        // computed index.
-        ulong voucherActive = 0UL;
-
+        ulong voucherActive;
 #if WANT_SOUL_JOKERS
-        uint legendaryTaken = 0u;
-        int soulCount = 0;
+        uint legendaryTaken;
+        int soulCount;
 #endif
+        int generatedFirstPack;
+        int abandoned;
+        int killed = 0;
 
-        int generatedFirstPack = 0;
-        int abandoned = 0;
-
-        for (int ante = 1; ante <= MAX_SEARCH_ANTE && !abandoned && !g.overflow; ante++) {
-
-            // This ante's slice of the stream table, freshly uninitialised.
-            for (int i = anteEnd[ante - 1]; i < anteEnd[ante]; i++) {
-                state[(size_t)i * gsize + gid] = NAN;
-            }
-
-            // ---- voucher (never skippable: it sets the shop rates) ----
-            int vIdx;
+        // Passes 0..NUM_STAGES-1 are prefilter stages; pass NUM_STAGES is the full scan.
+        for (int pass = 0; pass <= NUM_STAGES; pass++) {
+            const int isFull = (pass == NUM_STAGES);
+            int passFlags, lastAnte;
+            uint passMask;
+#if NUM_STAGES > 0
+            if (!isFull) {
+                passFlags = STAGE_FLAGS[pass];
+                lastAnte = STAGE_MAX_ANTE[pass];
+                passMask = STAGE_MASK[pass];
+            } else
+#endif
             {
-                int resample = 0;
-                vIdx = rnd_index(RND(F_VOUCHER, 0, ante, 0), NUM_VOUCHERS);
-                while (((vIdx & 1) && !((voucherActive >> (vIdx - 1)) & 1UL)) || ((voucherActive >> vIdx) & 1UL)) {
-                    resample++;
-                    if (resample >= MAX_RESAMPLE) { g.overflow = 1; break; }
-                    vIdx = rnd_index(RND(F_VOUCHER, 0, ante, resample), NUM_VOUCHERS);
-                }
-                if (g.overflow) break;
-                if (!voucherIgnored[vIdx]) {
-                    voucherActive |= (1UL << vIdx);
-                    if (vIdx & 1) voucherActive |= (1UL << (vIdx - 1));
-                }
+                passFlags = FULL_FLAGS;
+                lastAnte = MAX_SEARCH_ANTE;
+                passMask = ALL_MASK;
             }
 
-            // ---- shop rates ----
-            double rate0 = 20.0;
-            double rate1 = ((voucherActive >> V_TAROT_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_TAROT_MERCHANT) & 1UL) ? 9.6 : 4.0);
-            double rate2 = ((voucherActive >> V_PLANET_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_PLANET_MERCHANT) & 1UL) ? 9.6 : 4.0);
-            double rate3 = ((voucherActive >> V_MAGIC_TRICK) & 1UL) ? 4.0 : 0.0;
-            double rateTotal = rate0 + rate1 + rate2 + rate3;
+            // Fresh generator state for every pass. Streams with no ante of their own (the
+            // Soul's legendary queue) are cleared here; each ante's slice as it starts.
+            for (int i = anteEnd[MAX_SEARCH_ANTE]; i < nStreams; i++) state[(size_t)i * gsize + gid] = NAN;
+            g.overflow = 0;
+            m.found = 0UL;
+            m.unmet = popcount(passMask);
+            m.dead = 0;
+            m.total = 0.0;
+            voucherActive = 0UL;
+#if WANT_SOUL_JOKERS
+            legendaryTaken = 0u;
+            soulCount = 0;
+#endif
+            generatedFirstPack = 0;
+            abandoned = 0;
 
-            // ---- packs ----
-            const int numPacks = (ante == 1) ? 4 : 6;
-            int jokerSlot = 0;
+            for (int ante = 1; ante <= lastAnte && !abandoned && !g.overflow; ante++) {
 
-            for (int p = 0; p < numPacks && !g.overflow; p++) {
-                int kind;
-                if (ante <= 2 && !generatedFirstPack) {
-                    generatedFirstPack = 1;
-                    kind = BUFFOON_PACK_INDEX;
-                } else {
-                    const double poll = RND(F_SHOP_PACK, 0, ante, 0) * PACK_TOTAL_WEIGHT;
-                    kind = NUM_PACK_KINDS - 1;
-                    for (int i = 0; i < NUM_PACK_KINDS; i++) {
-                        if (packCum[i] >= poll) { kind = i; break; }
-                    }
+                for (int i = anteEnd[ante - 1]; i < anteEnd[ante]; i++) {
+                    state[(size_t)i * gsize + gid] = NAN;
                 }
 
-                const int family = packFamily[kind];
-                const int size = packSize[kind];
+                double rate0 = 0.0, rate1 = 0.0, rate2 = 0.0, rate3 = 0.0, rateTotal = 0.0;
 
-                if (family == PACK_BUFFOON) {
+                if (isFull) {
+                    // ---- voucher (never skippable in the full pass: it sets the shop rates).
+                    // Stages skip it: packs never read the voucher or its stream. ----
+                    int vIdx;
+                    int resample = 0;
+                    vIdx = rnd_index(RND(F_VOUCHER, 0, ante, 0), NUM_VOUCHERS);
+                    while (((vIdx & 1) && !((voucherActive >> (vIdx - 1)) & 1UL)) || ((voucherActive >> vIdx) & 1UL)) {
+                        resample++;
+                        if (resample >= MAX_RESAMPLE) { g.overflow = 1; break; }
+                        vIdx = rnd_index(RND(F_VOUCHER, 0, ante, resample), NUM_VOUCHERS);
+                    }
+                    if (g.overflow) break;
+                    if (!voucherIgnored[vIdx]) {
+                        voucherActive |= (1UL << vIdx);
+                        if (vIdx & 1) voucherActive |= (1UL << (vIdx - 1));
+                    }
+
+                    rate0 = 20.0;
+                    rate1 = ((voucherActive >> V_TAROT_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_TAROT_MERCHANT) & 1UL) ? 9.6 : 4.0);
+                    rate2 = ((voucherActive >> V_PLANET_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_PLANET_MERCHANT) & 1UL) ? 9.6 : 4.0);
+                    rate3 = ((voucherActive >> V_MAGIC_TRICK) & 1UL) ? 4.0 : 0.0;
+                    rateTotal = rate0 + rate1 + rate2 + rate3;
+                }
+
+                // ---- packs ----
+                const int numPacks = (ante == 1) ? 4 : 6;
+                int jokerSlot = 0;
+
+                for (int p = 0; p < numPacks && !g.overflow; p++) {
+                    int kind;
+                    if (ante <= 2 && !generatedFirstPack) {
+                        generatedFirstPack = 1;
+                        kind = BUFFOON_PACK_INDEX;
+                    } else {
+                        const double poll = RND(F_SHOP_PACK, 0, ante, 0) * PACK_TOTAL_WEIGHT;
+                        kind = NUM_PACK_KINDS - 1;
+                        for (int i = 0; i < NUM_PACK_KINDS; i++) {
+                            if (packCum[i] >= poll) { kind = i; break; }
+                        }
+                    }
+
+                    const int family = packFamily[kind];
+                    const int size = packSize[kind];
+
+                    if (family == PACK_BUFFOON) {
 #if WANT_JOKERS
-                    int excluded[8];
-                    int nExcluded = 0;
-                    for (int c = 0; c < size && !g.overflow; c++) {
-                        const double rv = RND(F_RARITY, SRC_BUF, ante, 0);
-                        const int rarity = (rv > 0.95) ? R_RARE : ((rv > 0.7) ? R_UNCOMMON : R_COMMON);
-                        const int poolN = (rarity == R_RARE) ? POOL_N_RARE
-                                        : ((rarity == R_UNCOMMON) ? POOL_N_UNCOMMON : POOL_N_COMMON);
-                        const int fam = (rarity == R_RARE) ? F_JOKER3
-                                      : ((rarity == R_UNCOMMON) ? F_JOKER2 : F_JOKER1);
+                        if (passFlags & ST_JOKERS) {
+                        int excluded[8];
+                        int nExcluded = 0;
+                        for (int c = 0; c < size && !g.overflow; c++) {
+                            const double rv = RND(F_RARITY, SRC_BUF, ante, 0);
+                            const int rarity = (rv > 0.95) ? R_RARE : ((rv > 0.7) ? R_UNCOMMON : R_COMMON);
+                            const int poolN = (rarity == R_RARE) ? POOL_N_RARE
+                                            : ((rarity == R_UNCOMMON) ? POOL_N_UNCOMMON : POOL_N_COMMON);
+                            const int fam = (rarity == R_RARE) ? F_JOKER3
+                                          : ((rarity == R_UNCOMMON) ? F_JOKER2 : F_JOKER1);
 
-                        int idx = rnd_index(RND(fam, SRC_BUF, ante, 0), poolN);
-                        int code = ITEM_CODE(rarity, idx);
-                        int n = 0;
-                        int dup = 1;
-                        while (dup && !g.overflow) {
-                            dup = 0;
-                            for (int e = 0; e < nExcluded; e++) if (excluded[e] == code) { dup = 1; break; }
-                            if (!dup) break;
-                            n++;
-                            if (n >= MAX_RESAMPLE) { g.overflow = 1; break; }
-                            idx = rnd_index(RND(fam, SRC_BUF, ante, n), poolN);
-                            code = ITEM_CODE(rarity, idx);
-                        }
-                        if (g.overflow) break;
-                        if (nExcluded < 8) excluded[nExcluded++] = code;
+                            int idx = rnd_index(RND(fam, SRC_BUF, ante, 0), poolN);
+                            int code = ITEM_CODE(rarity, idx);
+                            int n = 0;
+                            int dup = 1;
+                            while (dup && !g.overflow) {
+                                dup = 0;
+                                for (int e = 0; e < nExcluded; e++) if (excluded[e] == code) { dup = 1; break; }
+                                if (!dup) break;
+                                n++;
+                                if (n >= MAX_RESAMPLE) { g.overflow = 1; break; }
+                                idx = rnd_index(RND(fam, SRC_BUF, ante, n), poolN);
+                                code = ITEM_CODE(rarity, idx);
+                            }
+                            if (g.overflow) break;
+                            if (nExcluded < 8) excluded[nExcluded++] = code;
 
-                        int edition = 0;
+                            int edition = 0;
 #if WANT_EDITIONS
-                        {
-                            const double ev = RND(F_EDITION, SRC_BUF, ante, 0);
-                            edition = (ev > 0.997) ? 4 : ((ev > 0.994) ? 3 : ((ev > 0.98) ? 2 : ((ev > 0.96) ? 1 : 0)));
+                            if (passFlags & ST_EDITIONS) {
+                                const double ev = RND(F_EDITION, SRC_BUF, ante, 0);
+                                edition = (ev > 0.997) ? 4 : ((ev > 0.994) ? 3 : ((ev > 0.98) ? 2 : ((ev > 0.96) ? 1 : 0)));
+                            }
+#endif
+                            jokerSlot++;
+                            OFFER(code, edition, ante, jokerSlot, SB_PACK);
+                        }
                         }
 #endif
-                        jokerSlot++;
-                        OFFER(code, edition, ante, jokerSlot, SB_PACK);
                     }
-#endif
-                }
-                else if (family == PACK_ARCANA) {
+                    else if (family == PACK_ARCANA) {
 #if WANT_TAROTS
-                    // The soul roll stays mandatory here even though it is on its own
-                    // stream: a slot that turns into a Soul does not draw a tarot, so
-                    // skipping it would desync the tarot stream.
-                    int tex[8];
-                    int nTex = 0;
-                    for (int c = 0; c < size && !g.overflow; c++) {
-                        if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
-                            OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
-                            SOUL_FOUND(ante);
-                            continue;
+                        // The soul roll stays mandatory here: a slot that turns into a Soul
+                        // does not draw a tarot, so skipping it would desync the tarot stream.
+                        if (passFlags & ST_TAROTS) {
+                        int tex[8];
+                        int nTex = 0;
+                        for (int c = 0; c < size && !g.overflow; c++) {
+                            if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
+                                OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
+                                SOUL_FOUND(ante);
+                                continue;
+                            }
+                            int idx = rnd_index(RND(F_TAROT, SRC_AR1, ante, 0), POOL_N_TAROTS);
+                            int code = TAROT_BASE | idx;
+                            int n = 0;
+                            int dup = 1;
+                            while (dup) {
+                                dup = 0;
+                                for (int e = 0; e < nTex; e++) if (tex[e] == code) { dup = 1; break; }
+                                if (!dup) break;
+                                n++;
+                                if (n >= MAX_RESAMPLE) { g.overflow = 1; break; }
+                                idx = rnd_index(RND(F_TAROT, SRC_AR1, ante, n), POOL_N_TAROTS);
+                                code = TAROT_BASE | idx;
+                            }
+                            if (g.overflow) break;
+                            if (nTex < 8) tex[nTex++] = code;
+                            OFFER(code, 0, ante, c + 1, SB_PACK);
                         }
-                        int idx = rnd_index(RND(F_TAROT, SRC_AR1, ante, 0), POOL_N_TAROTS);
-                        int code = TAROT_BASE | idx;
-                        int n = 0;
-                        int dup = 1;
-                        while (dup) {
-                            dup = 0;
-                            for (int e = 0; e < nTex; e++) if (tex[e] == code) { dup = 1; break; }
-                            if (!dup) break;
-                            n++;
-                            if (n >= MAX_RESAMPLE) { g.overflow = 1; break; }
-                            idx = rnd_index(RND(F_TAROT, SRC_AR1, ante, n), POOL_N_TAROTS);
-                            code = TAROT_BASE | idx;
-                        }
-                        if (g.overflow) break;
-                        if (nTex < 8) tex[nTex++] = code;
-                        OFFER(code, 0, ante, c + 1, SB_PACK);
-                    }
-#elif WANT_SOULS
-                    for (int c = 0; c < size && !g.overflow; c++) {
-                        if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
-                            OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
-                            SOUL_FOUND(ante);
-                        }
-                    }
+                        } else
 #endif
-                }
-#if WANT_SOULS || WANT_SPECTRALS
-                else if (family == PACK_CELESTIAL) {
+                        {
 #if WANT_SOULS
-                    // Celestial packs can only substitute Black Hole, never a Soul.
-                    for (int c = 0; c < size && !g.overflow; c++) {
-                        if (RND(F_SOUL_PLANET, 0, ante, 0) > 0.997) {
-                            OFFER(CODE_BLACK_HOLE, 0, ante, c + 1, SB_PACK);
+                            if (passFlags & ST_SOULS) {
+                                for (int c = 0; c < size && !g.overflow; c++) {
+                                    if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
+                                        OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
+                                        SOUL_FOUND(ante);
+                                    }
+                                }
+                            }
+#endif
+                        }
+                    }
+#if WANT_SOULS || WANT_SPECTRALS
+                    else if (family == PACK_CELESTIAL) {
+#if WANT_SOULS
+                        // Celestial packs can only substitute Black Hole, never a Soul.
+                        if (passFlags & ST_SOULS) {
+                            for (int c = 0; c < size && !g.overflow; c++) {
+                                if (RND(F_SOUL_PLANET, 0, ante, 0) > 0.997) {
+                                    OFFER(CODE_BLACK_HOLE, 0, ante, c + 1, SB_PACK);
+                                }
+                            }
+                        }
+#endif
+                    }
+                    else if (family == PACK_SPECTRAL) {
+#if WANT_SPECTRALS
+                        if (passFlags & ST_SPECTRALS) {
+                            SCAN_SPECTRAL_FULL(ante, size);
+                        } else
+#endif
+                        {
+#if WANT_SOULS
+                            if (passFlags & ST_SOULS) {
+                                SCAN_SPECTRAL_SOULS(ante, size);
+                            }
+#endif
                         }
                     }
 #endif
                 }
-                else if (family == PACK_SPECTRAL) {
-                    SCAN_SPECTRAL_PACK(ante, size);
-                }
+
+                if (g.overflow) break;
+
+                // ---- shop (full pass only) ----
+                //
+                // Generated only up to the last slot any unmet condition could still use,
+                // and not at all in an ante where nothing accepts shop cards (#1). Its
+                // streams live in registers for the length of the loop (#3).
+                if (isFull) {
+                    double sCdt = NAN, sRar = NAN, sJ1 = NAN, sJ2 = NAN, sJ3 = NAN, sEdi = NAN, sTar = NAN;
+                    __constant const int *scid = SHOP_CID + ante * NUM_SHOP_STREAMS;
+
+                    for (int slot = 1; slot <= SHOP_ITEMS; slot++) {
+                        if (m.unmet == 0) break;
+
+                        {
+                            int wanted;
+                            SHOP_WANTED(ante, slot, wanted);
+                            if (!wanted) break;
+                        }
+
+                        CLOSE_SLOT(ante, slot);
+                        if (m.dead) break;
+
+                        if (useBound) {
+                            double bound;
+                            UPPER_BOUND(ante, slot, bound);
+                            if (bound <= cutoff) { abandoned = 1; break; }
+                        }
+
+                        double roll = RNDR(scid[SS_CDT], &sCdt) * rateTotal;
+                        int type;
+                        if (roll < rate0) type = 0;
+                        else {
+                            roll -= rate0;
+                            if (roll < rate1) type = 1;
+                            else {
+                                roll -= rate1;
+                                if (roll < rate2) type = 2;
+                                else { roll -= rate2; type = (roll < rate3) ? 3 : 4; }
+                            }
+                        }
+
+                        if (type == 0) {
+#if WANT_JOKERS
+                            const double rv = RNDR(scid[SS_RARITY], &sRar);
+                            const int rarity = (rv > 0.95) ? R_RARE : ((rv > 0.7) ? R_UNCOMMON : R_COMMON);
+                            const int poolN = (rarity == R_RARE) ? POOL_N_RARE
+                                            : ((rarity == R_UNCOMMON) ? POOL_N_UNCOMMON : POOL_N_COMMON);
+                            // Pick the rarity's stream by value, draw, and put it back. Selects
+                            // rather than a pointer into an array, so all three stay registers.
+                            double sj = (rarity == R_RARE) ? sJ3 : ((rarity == R_UNCOMMON) ? sJ2 : sJ1);
+                            const int idx = rnd_index(RNDR(scid[SS_JOKER1 + rarity], &sj), poolN);
+                            if (rarity == R_RARE) sJ3 = sj;
+                            else if (rarity == R_UNCOMMON) sJ2 = sj;
+                            else sJ1 = sj;
+                            const int code = ITEM_CODE(rarity, idx);
+
+                            int edition = 0;
+#if WANT_EDITIONS
+                            {
+                                const double ev = RNDR(scid[SS_EDITION], &sEdi);
+                                edition = (ev > 0.997) ? 4 : ((ev > 0.994) ? 3 : ((ev > 0.98) ? 2 : ((ev > 0.96) ? 1 : 0)));
+                            }
 #endif
-            }
+                            OFFER(code, edition, ante, slot, SB_SHOP);
+#endif
+                        }
+#if WANT_TAROTS
+                        else if (type == 1) {
+                            // Shop tarots are not soulable, so this is just the choice draw.
+                            const int tIdx = rnd_index(RNDR(scid[SS_TAROT], &sTar), POOL_N_TAROTS);
+                            OFFER(TAROT_BASE | tIdx, 0, ante, slot, SB_SHOP);
+                        }
+#endif
+                        // Remaining shop types draw nothing here. The planet is simply not
+                        // generated, the playing card never had a draw, and the shop
+                        // spectral rate is a hard 0 on this deck.
 
-            if (g.overflow) break;
+                        if (g.overflow) break;
+                    }
+                    // Keeps the compiler quiet about streams this search never draws.
+                    (void)sEdi; (void)sTar; (void)sRar; (void)sJ1; (void)sJ2; (void)sJ3;
+                }
 
-            // ---- shop ----
-            for (int slot = 1; slot <= SHOP_ITEMS; slot++) {
-                if (m.unmet == 0) break;
-
-                CLOSE_SLOT(ante, slot);
+                if (g.overflow) break;
                 if (m.dead) break;
 
-                {
+                CLOSE_ANTE(ante);
+                if (m.dead) break;
+
+                if (m.unmet == 0) break;
+
+                if (isFull && useBound && ante < MAX_SEARCH_ANTE) {
                     double bound;
-                    UPPER_BOUND(ante, slot, bound);
-                    if (bound <= cutoff) { abandoned = 1; break; }
+                    UPPER_BOUND(ante + 1, 1, bound);
+                    if (bound <= cutoff) abandoned = 1;
                 }
-
-                double roll = RND(F_CDT, 0, ante, 0) * rateTotal;
-                int type;
-                if (roll < rate0) type = 0;
-                else {
-                    roll -= rate0;
-                    if (roll < rate1) type = 1;
-                    else {
-                        roll -= rate1;
-                        if (roll < rate2) type = 2;
-                        else { roll -= rate2; type = (roll < rate3) ? 3 : 4; }
-                    }
-                }
-
-                if (type == 0) {
-#if WANT_JOKERS
-                    const double rv = RND(F_RARITY, SRC_SHO, ante, 0);
-                    const int rarity = (rv > 0.95) ? R_RARE : ((rv > 0.7) ? R_UNCOMMON : R_COMMON);
-                    const int poolN = (rarity == R_RARE) ? POOL_N_RARE
-                                    : ((rarity == R_UNCOMMON) ? POOL_N_UNCOMMON : POOL_N_COMMON);
-                    const int fam = (rarity == R_RARE) ? F_JOKER3
-                                  : ((rarity == R_UNCOMMON) ? F_JOKER2 : F_JOKER1);
-                    const int idx = rnd_index(RND(fam, SRC_SHO, ante, 0), poolN);
-                    const int code = ITEM_CODE(rarity, idx);
-
-                    int edition = 0;
-#if WANT_EDITIONS
-                    {
-                        const double ev = RND(F_EDITION, SRC_SHO, ante, 0);
-                        edition = (ev > 0.997) ? 4 : ((ev > 0.994) ? 3 : ((ev > 0.98) ? 2 : ((ev > 0.96) ? 1 : 0)));
-                    }
-#endif
-                    OFFER(code, edition, ante, slot, SB_SHOP);
-#endif
-                }
-#if WANT_TAROTS
-                else if (type == 1) {
-                    // Shop tarots are not soulable, so this is just the choice draw.
-                    const int tIdx = rnd_index(RND(F_TAROT, SRC_SHO, ante, 0), POOL_N_TAROTS);
-                    OFFER(TAROT_BASE | tIdx, 0, ante, slot, SB_SHOP);
-                }
-#endif
-                // Remaining shop types draw nothing here. The planet is simply not
-                // generated (exactly as the CPU filter pass leaves it when Detail has it
-                // off), the playing card never had a draw, and the shop spectral slot is
-                // unreachable: its rate is a hard 0 on this deck, so the cdt cascade can
-                // never land on it.
-
-                if (g.overflow) break;
             }
 
-            if (g.overflow) break;
-            if (m.dead) break;
-
-            // The required-window kill, before the score bound: it is cheaper and it does
-            // not depend on the cutoff being well tuned.
-            CLOSE_ANTE(ante);
-            if (m.dead) break;
-
-            if (m.unmet == 0) break;
-
-            if (ante < MAX_SEARCH_ANTE) {
-                double bound;
-                UPPER_BOUND(ante + 1, 1, bound);
-                if (bound <= cutoff) abandoned = 1;
+            if (!isFull) {
+                // A stage only kills. If it could not decide (overflow), the next pass does.
+                if (!g.overflow && m.dead) { killed = 1; break; }
             }
         }
+
+        if (killed) continue;
 
         if (g.overflow) {
             const int slot = atomic_inc(&hitCount[1]);
