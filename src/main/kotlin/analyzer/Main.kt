@@ -2,12 +2,15 @@ package analyzer
 
 import analyzer.Util.editionFromDisplayName
 import analyzer.Util.jokerFromDisplayName
+import analyzer.Util.printReport
 import analyzer.Util.tarotFromDisplayName
 import executor.Task
 import executor.TaskManager
 import kotlinx.coroutines.*
+import kotlin.Boolean
 import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.system.exitProcess
 import kotlin.time.Duration.Companion.milliseconds
 
 // ---------------------------------------------------------------------------
@@ -556,6 +559,11 @@ suspend fun main(args: Array<String>) {
         kotlin.system.exitProcess(2)
     }
 
+    // Vouchers the player skips. Everything else is assumed bought the moment it appears.
+    val ignoredVouchers = listOf("Planet_Merchant", "Magic_Trick", "Tarot_Merchant")
+
+    opts.examine?.let { examineSeed(it, ignoredVouchers) }
+
     maxResults = opts.maxResults
     ClSearch.GLOBAL_SIZE = opts.globalSize
     ClSearch.LOCAL_SIZE = opts.localSize.toLong()
@@ -574,7 +582,6 @@ suspend fun main(args: Array<String>) {
             else "CPU only"))
 
     val shopItems = 100
-    val ignoredVouchers = listOf("Planet_Merchant", "Magic_Trick")
 
     // -----------------------------------------------------------------------
     // Conditions
@@ -611,7 +618,6 @@ suspend fun main(args: Array<String>) {
             editionPriority = 10,
             sources = Src.PACK,
         ),
-
         )
 
     val detail = Detail.forItems(
@@ -785,4 +791,20 @@ private fun printResults(shopItems: Int, start: Long) {
         )
     }
     println("Took ${System.currentTimeMillis() - start} ms")
+}
+
+/**
+ * Prints antes 1-8 of one seed in full: boss, voucher, tags, the first 20 shop slots, every
+ * pack, and the legendary each Soul hands out. Run with --examine SEED.
+ *
+ * One analyzer for the whole run, seeded once: vouchers, bosses and the Soul queue carry
+ * over from ante to ante, so a fresh analyzer per ante would print the wrong thing from
+ * ante 2 on.
+ */
+private fun examineSeed(seed: String, ignoredVouchers: List<String>) {
+    val analyzer = SeedAnalyzer(seed.uppercase(), Detail.FULL, ignoredVouchers)
+    println("Seed ${seed.uppercase()} (index ${"%,d".format(indexForSeed(seed))}), " +
+            "skipping vouchers: ${ignoredVouchers.joinToString(", ").ifEmpty { "none" }}")
+    for (ante in 1..8) printReport(analyzer.ante(ante, 20))
+    exitProcess(0)
 }

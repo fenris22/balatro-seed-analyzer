@@ -9,9 +9,28 @@ private const val PSEUDOHASH_K = 1.1239285023
 
 fun frac(x: Double): Double = x - floor(x)
 
+/**
+ * Rounds to 13 decimal places exactly as the game does.
+ *
+ * The game formats with string.format("%.13f") and parses it back, which rounds the exact
+ * decimal value of x. The old floor(x * 1e13 + 0.5) / 1e13 rounded the already-rounded
+ * product x * 1e13 instead, and got the wrong answer on about 1 draw in 2,800 -- enough to
+ * change something visible in ante 1 on roughly 2% of seeds (confirmed in game on
+ * SN266TQR).
+ *
+ * The fix: p = x * 1e13 is rounded, but fma recovers its exact error, so p + err is the
+ * true product. Round that half-up by checking which side of .5 it lands on, with exact
+ * ties going to even as printf does. k / 1e13 is then the nearest double to the 13-digit
+ * decimal, which is what tonumber gives back. Matches Python's correctly rounded formatting
+ * on 3 million test values. Mirrored exactly in search.cl.
+ */
 fun round13(x: Double): Double {
-    val power = 1e13
-    return floor(x * power + 0.5) / power
+    val p = x * 1e13
+    val err = Math.fma(x, 1e13, -p)
+    val fl = floor(p)
+    val side = (p - fl - 0.5) + err
+    val k = if (side > 0.0) fl + 1.0 else if (side < 0.0) fl else fl + (fl % 2.0)
+    return k / 1e13
 }
 
 /** Original single-string form -- only used once per seed (hashedSeed), not perf-critical. */
@@ -140,7 +159,13 @@ object RngKeys {
     const val CDT = 15; const val STDSET = 16; const val ENHANCED = 17
     const val STD_EDITION = 18; const val STDSEAL = 19; const val STDSEALTYPE = 20
     const val FRONTSTA = 21; const val SHOP_PACK = 22
-    const val FAMILY_COUNT = 23
+
+    /**
+     * Omen Globe's roll: each Arcana pack slot is a Spectral card instead of a Tarot when
+     * this beats 0.8. One stream for the whole run -- the key has no ante.
+     */
+    const val OMEN_GLOBE = 23
+    const val FAMILY_COUNT = 24
 
     const val SRC_NONE = 0; const val SRC_SHO = 1; const val SRC_BUF = 2
     const val SRC_AR1 = 3; const val SRC_PL1 = 4; const val SRC_SPE = 5
@@ -151,7 +176,10 @@ object RngKeys {
      * why adding it cannot disturb any existing result.
      */
     const val SRC_SOU = 6
-    const val SOURCE_COUNT = 7
+
+    /** Spectral cards Omen Globe puts into Arcana packs ("Spectralar2<ante>"). */
+    const val SRC_AR2 = 7
+    const val SOURCE_COUNT = 8
 
     const val MAX_ANTE = 15
     const val MAX_RESAMPLE = 16
@@ -159,11 +187,11 @@ object RngKeys {
     /** Total addressable streams; the per-worker state array is this long. */
     const val STREAM_COUNT = FAMILY_COUNT * SOURCE_COUNT * (MAX_ANTE + 1) * MAX_RESAMPLE
 
-    val SOURCE_NAMES = arrayOf("", "sho", "buf", "ar1", "pl1", "spe", "sou")
+    val SOURCE_NAMES = arrayOf("", "sho", "buf", "ar1", "pl1", "spe", "sou", "ar2")
 
     fun sourceId(source: String): Int = when (source) {
         "sho" -> SRC_SHO; "buf" -> SRC_BUF; "ar1" -> SRC_AR1
-        "pl1" -> SRC_PL1; "spe" -> SRC_SPE; "sou" -> SRC_SOU
+        "pl1" -> SRC_PL1; "spe" -> SRC_SPE; "sou" -> SRC_SOU; "ar2" -> SRC_AR2
         else -> SRC_NONE
     }
 
@@ -208,6 +236,7 @@ object RngKeys {
             STDSEALTYPE -> "stdsealtype$ante"
             FRONTSTA -> "frontsta$ante"
             SHOP_PACK -> "shop_pack$ante"
+            OMEN_GLOBE -> "omen_globe"
             else -> throw IllegalArgumentException("unknown family $family")
         }
     }

@@ -176,6 +176,9 @@ object ClSearch {
     private const val SS_EDITION = 5
     private const val SS_TAROT = 6
 
+    /** Stage must track vouchers; matches ST_VOUCHERS in search.cl. */
+    private const val ST_VOUCHERS = 64
+
     /** Stage content flags, matching ST_* in search.cl. */
     private fun stageFlags(d: Detail): Int =
         (if (d.jokers) 1 else 0) or (if (d.editions) 2 else 0) or (if (d.souls) 4 else 0) or
@@ -242,26 +245,32 @@ object ClSearch {
         val shopCid = IntArray((maxAnte + 1) * SHOP_STREAMS) { -1 }
 
         init {
-            val packDedup = 8
+            // Shop and pack cards are generated without duplicate prevention, so pack jokers
+            // and tarots each need a single slot. Spectrals keep a few
+            // resample slots: The Soul and Black Hole are always unavailable in the spectral
+            // pool, so landing on one rerolls.
+            val spectralRetry = 8
             for (a in 1..maxAnte) {
                 add(RngKeys.VOUCHER, 0, a, RngKeys.MAX_RESAMPLE)
                 add(RngKeys.SHOP_PACK, 0, a)
 
-                // Buffoon-pack jokers are deduplicated, hence the resample slots.
                 add(RngKeys.RARITY, RngKeys.SRC_BUF, a)
                 if (wantEditions) add(RngKeys.EDITION, RngKeys.SRC_BUF, a)
                 for (fam in intArrayOf(RngKeys.JOKER1, RngKeys.JOKER2, RngKeys.JOKER3)) {
-                    add(fam, RngKeys.SRC_BUF, a, packDedup)
+                    add(fam, RngKeys.SRC_BUF, a)
                 }
 
                 if (wantTarots) {
-                    add(RngKeys.TAROT, RngKeys.SRC_AR1, a, packDedup)
+                    add(RngKeys.TAROT, RngKeys.SRC_AR1, a)
                     add(RngKeys.SOUL_TAROT, 0, a)
+                    // An Omen Globe slot in an Arcana pack rolls the Spectral soul stream.
+                    add(RngKeys.SOUL_SPECTRAL, 0, a)
                 }
                 if (wantSpectrals) {
-                    // Spectrals only ever come from packs: the shop's spectral rate is a
-                    // hard 0 on this deck, so no SRC_SHO stream is ever reached.
-                    add(RngKeys.SPECTRAL, RngKeys.SRC_SPE, a, packDedup)
+                    // Spectrals only come from packs: the shop's spectral rate is a hard 0 on
+                    // this deck. SRC_AR2 is the Spectral card Omen Globe puts in Arcana packs.
+                    add(RngKeys.SPECTRAL, RngKeys.SRC_SPE, a, spectralRetry)
+                    add(RngKeys.SPECTRAL, RngKeys.SRC_AR2, a, spectralRetry)
                     add(RngKeys.SOUL_SPECTRAL, 0, a)
                 }
                 if (wantSouls) {
@@ -272,9 +281,11 @@ object ClSearch {
                 }
                 anteEnd[a] = ids.size
             }
-            // Streams with no ante of their own (the Soul's legendary queue) live past the
-            // last ante's slice and are cleared once per seed.
-            if (wantSouls) add(RngKeys.JOKER4, 0, 0, packDedup)
+            // Streams with no ante of their own -- the Soul's legendary queue and Omen
+            // Globe's roll -- live past the last ante's slice and are cleared once per pass.
+            // A Soul rerolls legendaries already handed out, on Joker4_resampleN.
+            if (wantSouls) add(RngKeys.JOKER4, 0, 0, RngKeys.MAX_RESAMPLE)
+            if (wantSouls || wantTarots || wantSpectrals) add(RngKeys.OMEN_GLOBE, 0, 0)
             stateCount = ids.size
             sealed = true
 
@@ -516,6 +527,12 @@ object ClSearch {
         d("V_PLANET_TYCOON", PoolArr.V_PLANET_TYCOON)
         d("V_PLANET_MERCHANT", PoolArr.V_PLANET_MERCHANT)
         d("V_MAGIC_TRICK", PoolArr.V_MAGIC_TRICK)
+        d("V_HONE", PoolArr.V_HONE)
+        d("V_GLOW_UP", PoolArr.V_GLOW_UP)
+        d("V_OMEN_GLOBE", PoolArr.V_OMEN_GLOBE)
+        d("V_TELESCOPE", PoolArr.V_TELESCOPE)
+        d("V_OVERSTOCK", PoolArr.V_OVERSTOCK)
+        d("V_OVERSTOCK_PLUS", PoolArr.V_OVERSTOCK_PLUS)
 
         // Register-resident shop streams (#3).
         d("NUM_SHOP_STREAMS", SHOP_STREAMS)
@@ -527,7 +544,8 @@ object ClSearch {
         if (stages.isNotEmpty()) {
             d("STAGE_MAX_ANTE_INIT", stages.joinToString(",", "{", "}") { it.maxAnte.toString() })
             d("STAGE_FLAGS_INIT", stages.joinToString(",", "{", "}") {
-                stageFlags(SearchPlanner.clampTo(it, detail)).toString()
+                (stageFlags(SearchPlanner.clampTo(it, detail)) or
+                        (if (it.needsVouchers(conditions)) ST_VOUCHERS else 0)).toString()
             })
             d("STAGE_MASK_INIT", stages.joinToString(",", "{", "}") { st ->
                 var mask = 0
@@ -1024,6 +1042,7 @@ object ClSearch {
 
         /** How far behind the queue is, for the progress line. */
         fun backlog(): Int = queue.size
+
     }
 
     // --- multiple devices -------------------------------------------------------

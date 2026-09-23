@@ -20,6 +20,8 @@ data class RunOptions(
     val globalSize: Int,
     val localSize: Int,
     val chunk: Int,
+    /** --examine SEED: print that seed's antes and exit instead of searching. */
+    val examine: String? = null,
 ) {
     val seedsToCount: Long get() = endIndex - startIndex
 
@@ -69,6 +71,7 @@ object Cli {
                 "power of 2 from 2048 to 16384 recommended)"),
         Flag("--local-size", "N", "GPU work-group size (default ${d.localSize}; power of 2 from 64 to 256 recommended)"),
         Flag("--chunk", "N", "Seeds per GPU launch (default ${fmt(d.chunk.toLong())}; 2m to 64m recommended)"),
+        Flag("--examine", "SEED", "Print antes 1-8 of one seed in full and exit, without searching"),
         Flag("--help", null, "Show this list and exit"),
     )
 
@@ -163,6 +166,13 @@ object Cli {
                 "--global-size" -> o.copy(globalSize = toInt(name, value))
                 "--local-size" -> o.copy(localSize = toInt(name, value))
                 "--chunk" -> o.copy(chunk = toInt(name, value))
+                "--examine" -> {
+                    val seed = value.trim().uppercase()
+                    if (seed.isEmpty() || seed.length > 8 || seed.any { it !in SEED_CHARS }) {
+                        throw CliError("--examine: '$value' is not a seed (1-8 characters from $SEED_CHARS)")
+                    }
+                    o.copy(examine = seed)
+                }
                 else -> throw CliError("unknown flag '$name'")
             }
             i++
@@ -185,7 +195,7 @@ object Cli {
         if (o.startIndex >= o.endIndex) {
             throw CliError("--start-index ${"%,d".format(o.startIndex)} must be below --end-index ${"%,d".format(o.endIndex)}")
         }
-        if (o.localSize !in 1 .. LOCAL_SIZE_LIMIT) {
+        if (o.localSize < 1 || o.localSize > LOCAL_SIZE_LIMIT) {
             throw CliError("--local-size must be between 1 and $LOCAL_SIZE_LIMIT")
         }
         if (o.globalSize < 1) throw CliError("--global-size must be at least 1")

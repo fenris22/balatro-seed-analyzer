@@ -1,12 +1,5 @@
 package analyzer
 
-data class ItemLocation(
-    val ante: Int,
-    val itemNumber: Int,
-    val location: String,
-    val item: Item
-)
-
 object Util {
 
     private val jokerByDisplayName: Map<String, Item> by lazy { Pools.JOKERS.associateBy { it.displayName } }
@@ -32,6 +25,8 @@ object Util {
         spectralByDisplayName[displayName] ?: error("Unknown spectral: $displayName")
 
 
+
+
     fun printReport(r: AnteReport) {
         println("\n==ANTE ${r.ante}==")
         println("Boss: ${r.boss}")
@@ -54,11 +49,13 @@ object Util {
             }
             println("  ${p.kind.item.displayName}: $contents")
         }
+        if (r.soulJokers.isNotEmpty()) println("Souls give: ${r.soulJokers.joinToString(", ")}")
     }
 
     //val knownSeed = "5I2A9TS8"
 
     /**
+
 
     OLD CONDITIONS, NEW CONDITIONS:
 

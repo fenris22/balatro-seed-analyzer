@@ -64,7 +64,8 @@
 #define SRC_PL1  4
 #define SRC_SPE  5
 #define SRC_SOU  6
-#define SOURCE_COUNT 7
+#define SRC_AR2  7      // Spectral cards Omen Globe puts into Arcana packs
+#define SOURCE_COUNT 8
 
 #define F_BOSS 0
 #define F_VOUCHER 1
@@ -83,6 +84,7 @@
 #define F_SPECTRAL 14
 #define F_CDT 15
 #define F_SHOP_PACK 22
+#define F_OMEN_GLOBE 23
 
 #define PACK_BUFFOON 0
 #define PACK_ARCANA 1
@@ -114,7 +116,28 @@ __constant double DECAY[5] = { 10.0, 6.0, 3.0, 2.0, 1.0 };
 FORCE_INLINE double decay_at(int d) { return (d < 5) ? DECAY[d] : 0.0; }
 
 FORCE_INLINE double frac_d(double x) { return x - floor(x); }
-FORCE_INLINE double round13(double x) { return floor(x * 1e13 + 0.5) / 1e13; }
+
+// poll_edition from the game, in its exact arithmetic: 4 Negative, 3 Polychrome, 2 Holo,
+// 1 Foil, 0 none. rate is 1, or 2 with Hone, 4 with Glow Up; Negative ignores it.
+FORCE_INLINE int poll_edition(double poll, double rate, double mod, int noNeg) {
+    if (!noNeg && poll > 1.0 - 0.003 * mod) return 4;
+    if (poll > 1.0 - 0.006 * rate * mod) return 3;
+    if (poll > 1.0 - 0.02 * rate * mod) return 2;
+    if (poll > 1.0 - 0.04 * rate * mod) return 1;
+    return 0;
+}
+// Rounds to 13 decimals exactly as the game's string.format("%.13f") does. x * 1e13 is
+// itself rounded, but fma recovers its exact error, so the half-way test is made on the
+// true product. The old floor(x * 1e13 + 0.5) got about 1 draw in 2,800 wrong. Mirrors
+// round13 in Rng.kt; fma is an explicit call, so FP_CONTRACT OFF does not affect it.
+FORCE_INLINE double round13(double x) {
+    const double p = x * 1e13;
+    const double err = fma(x, 1e13, -p);
+    const double fl = floor(p);
+    const double side = (p - fl - 0.5) + err;
+    const double k = (side > 0.0) ? fl + 1.0 : ((side < 0.0) ? fl : fl + fmod(fl, 2.0));
+    return k / 1e13;
+}
 
 FORCE_INLINE double lua_draw(double d0) {
     double d = d0;
@@ -290,6 +313,7 @@ __constant int SHOP_CID[(MAX_SEARCH_ANTE + 1) * NUM_SHOP_STREAMS] = SHOP_CID_INI
 #define ST_SOUL_JOKERS  8
 #define ST_TAROTS       16
 #define ST_SPECTRALS    32
+#define ST_VOUCHERS     64   // this stage must track vouchers (Omen Globe, Telescope, Hone)
 
 #define FULL_FLAGS ((WANT_JOKERS ? ST_JOKERS : 0) | (WANT_EDITIONS ? ST_EDITIONS : 0) \
                   | (WANT_SOULS ? ST_SOULS : 0) | (WANT_SOUL_JOKERS ? ST_SOUL_JOKERS : 0) \
@@ -446,73 +470,58 @@ FORCE_INLINE double best_per_match_from(__constant const int *anteMin, __constan
     } while (0)
 
 #if WANT_SOUL_JOKERS
-// The Joker4 stream carries no source or ante, so it is one queue for the whole run. The
+// The Joker4 stream carries no source or ante, so it is one queue for the whole run.
+// Showman is assumed never held for Souls: a legendary already taken is rerolled on
+// "Joker4_resample2", "_resample3", ... A Soul once all five are held has nothing left to
+// roll, so the seed is punted to the host, which lists it at the end of the run. The
 // edition is rolled on its own "sou" stream.
 #define SOUL_FOUND(ante_)                                                          \
     do {                                                                           \
         soulCount++;                                                               \
         if (passFlags & ST_SOUL_JOKERS) {                                          \
-        int _li = rnd_index(RND(F_JOKER4, 0, 0, 0), POOL_N_LEGENDARY);             \
-        int _ln = 0;                                                               \
-        while (legendaryTaken & (1u << _li)) {                                     \
-            _ln++;                                                                 \
-            if (_ln >= MAX_RESAMPLE) { g.overflow = 1; break; }                    \
-            _li = rnd_index(RND(F_JOKER4, 0, 0, _ln), POOL_N_LEGENDARY);           \
-        }                                                                          \
-        if (!g.overflow) {                                                         \
-            legendaryTaken |= (1u << _li);                                         \
-            int _sed = 0;                                                          \
-            if (WANT_EDITIONS && (passFlags & ST_EDITIONS)) {                      \
-                const double _ev = RND(F_EDITION, SRC_SOU, (ante_), 0);            \
-                _sed = (_ev > 0.997) ? 4 : ((_ev > 0.994) ? 3                      \
-                     : ((_ev > 0.98) ? 2 : ((_ev > 0.96) ? 1 : 0)));               \
+            int _li = rnd_index(RND(F_JOKER4, 0, 0, 0), POOL_N_LEGENDARY);         \
+            if (legendaryTaken == (1u << POOL_N_LEGENDARY) - 1u) { g.overflow = 1; } \
+            int _ln = 0;                                                           \
+            while (!g.overflow && ((legendaryTaken >> _li) & 1u)) {                \
+                _ln++;                                                             \
+                if (_ln >= MAX_RESAMPLE) { g.overflow = 1; break; }                \
+                _li = rnd_index(RND(F_JOKER4, 0, 0, _ln), POOL_N_LEGENDARY);       \
             }                                                                      \
-            OFFER(ITEM_CODE(R_LEGENDARY, _li), _sed, (ante_), soulCount, SB_SOUL); \
-        }                                                                          \
+            if (!g.overflow) {                                                     \
+                legendaryTaken |= (1u << _li);                                     \
+                int _sed = 0;                                                      \
+                if (WANT_EDITIONS && (passFlags & ST_EDITIONS)) {                  \
+                    _sed = poll_edition(RND(F_EDITION, SRC_SOU, (ante_), 0), edRate, 1.0, 0); \
+                }                                                                  \
+                OFFER(ITEM_CODE(R_LEGENDARY, _li), _sed, (ante_), soulCount, SB_SOUL); \
+            }                                                                      \
         }                                                                          \
     } while (0)
 #else
 #define SOUL_FOUND(ante_) do { } while (0)
 #endif
 
-// A Spectral pack slot with the spectral itself drawn: the two substitution rolls first
-// (Black Hole wins when both hit), and only if neither fires does the slot draw an actual
-// spectral. RETRY entries in the pool are re-rolled.
-#define SCAN_SPECTRAL_FULL(ante_, size_)                                           \
+// One soulable Spectral card in a pack slot: a Spectral pack's own card (SRC_SPE), or one
+// Omen Globe put into an Arcana pack (SRC_AR2). The two substitution rolls come first
+// (Black Hole wins when both hit); only if neither fires, and spectrals are wanted, is the
+// card itself drawn. The Soul and Black Hole sit in the spectral pool but are always
+// unavailable there, so landing on one ("RETRY") rerolls -- the one resample left.
+#define SPECTRAL_SLOT(ante_, src_, slot_)                                          \
     do {                                                                           \
-        int sex[8]; int nSex = 0;                                                  \
-        for (int c = 0; c < (size_) && !g.overflow; c++) {                         \
-            int isSoul = 0, isBH = 0;                                              \
-            if (RND(F_SOUL_SPECTRAL, 0, (ante_), 0) > 0.997) isSoul = 1;           \
-            if (RND(F_SOUL_SPECTRAL, 0, (ante_), 0) > 0.997) { isSoul = 0; isBH = 1; } \
-            if (isSoul) { OFFER(CODE_SOUL, 0, (ante_), c + 1, SB_PACK); SOUL_FOUND(ante_); continue; } \
-            if (isBH) { OFFER(CODE_BLACK_HOLE, 0, (ante_), c + 1, SB_PACK); continue; } \
-            int idx = rnd_index(RND(F_SPECTRAL, SRC_SPE, (ante_), 0), POOL_N_SPECTRALS); \
-            int n = 0; int bad = 1;                                                \
-            while (bad) {                                                          \
-                bad = ((SPECTRAL_RETRY_MASK >> idx) & 1UL) ? 1 : 0;                \
-                if (!bad) for (int e = 0; e < nSex; e++) if (sex[e] == idx) { bad = 1; break; } \
-                if (!bad) break;                                                   \
-                n++;                                                               \
-                if (n >= MAX_RESAMPLE) { g.overflow = 1; break; }                  \
-                idx = rnd_index(RND(F_SPECTRAL, SRC_SPE, (ante_), n), POOL_N_SPECTRALS); \
+        int _isSoul = 0, _isBH = 0;                                                \
+        if (RND(F_SOUL_SPECTRAL, 0, (ante_), 0) > 0.997) _isSoul = 1;              \
+        if (RND(F_SOUL_SPECTRAL, 0, (ante_), 0) > 0.997) { _isSoul = 0; _isBH = 1; } \
+        if (_isSoul) { OFFER(CODE_SOUL, 0, (ante_), (slot_), SB_PACK); SOUL_FOUND(ante_); } \
+        else if (_isBH) { OFFER(CODE_BLACK_HOLE, 0, (ante_), (slot_), SB_PACK); }  \
+        else if (WANT_SPECTRALS && (passFlags & ST_SPECTRALS)) {                   \
+            int _idx = rnd_index(RND(F_SPECTRAL, (src_), (ante_), 0), POOL_N_SPECTRALS); \
+            int _n = 0;                                                            \
+            while ((SPECTRAL_RETRY_MASK >> _idx) & 1UL) {                          \
+                _n++;                                                              \
+                if (_n >= MAX_RESAMPLE) { g.overflow = 1; break; }                 \
+                _idx = rnd_index(RND(F_SPECTRAL, (src_), (ante_), _n), POOL_N_SPECTRALS); \
             }                                                                      \
-            if (g.overflow) break;                                                 \
-            if (nSex < 8) sex[nSex++] = idx;                                       \
-            OFFER(SPECTRAL_BASE | idx, 0, (ante_), c + 1, SB_PACK);                \
-        }                                                                          \
-    } while (0)
-
-// Souls-only: the substitution rolls are on their own stream, so the spectral choice
-// never has to be made.
-#define SCAN_SPECTRAL_SOULS(ante_, size_)                                          \
-    do {                                                                           \
-        for (int c = 0; c < (size_) && !g.overflow; c++) {                         \
-            int isSoul = 0, isBH = 0;                                              \
-            if (RND(F_SOUL_SPECTRAL, 0, (ante_), 0) > 0.997) isSoul = 1;           \
-            if (RND(F_SOUL_SPECTRAL, 0, (ante_), 0) > 0.997) { isSoul = 0; isBH = 1; } \
-            if (isSoul) { OFFER(CODE_SOUL, 0, (ante_), c + 1, SB_PACK); SOUL_FOUND(ante_); } \
-            else if (isBH) { OFFER(CODE_BLACK_HOLE, 0, (ante_), c + 1, SB_PACK); } \
+            if (!g.overflow) OFFER(SPECTRAL_BASE | _idx, 0, (ante_), (slot_), SB_PACK); \
         }                                                                          \
     } while (0)
 
@@ -607,7 +616,7 @@ __kernel void search(
         Match m;
         ulong voucherActive;
 #if WANT_SOUL_JOKERS
-        uint legendaryTaken;
+        uint legendaryTaken;   // legendaries handed out so far; later Souls reroll these
         int soulCount;
 #endif
         int generatedFirstPack;
@@ -654,11 +663,19 @@ __kernel void search(
                     state[(size_t)i * gsize + gid] = NAN;
                 }
 
-                double rate0 = 0.0, rate1 = 0.0, rate2 = 0.0, rate3 = 0.0, rateTotal = 0.0;
+                // Rates as they stand before this ante's voucher: the ante's first shop deals
+                // its opening cards (the first entryShop slots) before the voucher can be
+                // bought. Everything after, packs included, uses the rates with it.
+                double pRate0 = 20.0;
+                double pRate1 = ((voucherActive >> V_TAROT_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_TAROT_MERCHANT) & 1UL) ? 9.6 : 4.0);
+                double pRate2 = ((voucherActive >> V_PLANET_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_PLANET_MERCHANT) & 1UL) ? 9.6 : 4.0);
+                double pRate3 = ((voucherActive >> V_MAGIC_TRICK) & 1UL) ? 4.0 : 0.0;
+                const double pEdRate = ((voucherActive >> V_GLOW_UP) & 1UL) ? 4.0 : (((voucherActive >> V_HONE) & 1UL) ? 2.0 : 1.0);
+                const int entryShop = 2 + (int)((voucherActive >> V_OVERSTOCK) & 1UL) + (int)((voucherActive >> V_OVERSTOCK_PLUS) & 1UL);
 
-                if (isFull) {
-                    // ---- voucher (never skippable in the full pass: it sets the shop rates).
-                    // Stages skip it: packs never read the voucher or its stream. ----
+                // ---- voucher. Always in the full pass (it sets the shop rates); in a stage
+                // only when that stage's packs depend on it (Omen Globe, Telescope, Hone). ----
+                if (isFull || (passFlags & ST_VOUCHERS)) {
                     int vIdx;
                     int resample = 0;
                     vIdx = rnd_index(RND(F_VOUCHER, 0, ante, 0), NUM_VOUCHERS);
@@ -672,13 +689,15 @@ __kernel void search(
                         voucherActive |= (1UL << vIdx);
                         if (vIdx & 1) voucherActive |= (1UL << (vIdx - 1));
                     }
-
-                    rate0 = 20.0;
-                    rate1 = ((voucherActive >> V_TAROT_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_TAROT_MERCHANT) & 1UL) ? 9.6 : 4.0);
-                    rate2 = ((voucherActive >> V_PLANET_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_PLANET_MERCHANT) & 1UL) ? 9.6 : 4.0);
-                    rate3 = ((voucherActive >> V_MAGIC_TRICK) & 1UL) ? 4.0 : 0.0;
-                    rateTotal = rate0 + rate1 + rate2 + rate3;
                 }
+
+                const double rate0 = 20.0;
+                const double rate1 = ((voucherActive >> V_TAROT_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_TAROT_MERCHANT) & 1UL) ? 9.6 : 4.0);
+                const double rate2 = ((voucherActive >> V_PLANET_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_PLANET_MERCHANT) & 1UL) ? 9.6 : 4.0);
+                const double rate3 = ((voucherActive >> V_MAGIC_TRICK) & 1UL) ? 4.0 : 0.0;
+                const double edRate = ((voucherActive >> V_GLOW_UP) & 1UL) ? 4.0 : (((voucherActive >> V_HONE) & 1UL) ? 2.0 : 1.0);
+                const int omenGlobe = (int)((voucherActive >> V_OMEN_GLOBE) & 1UL);
+                const int telescope = (int)((voucherActive >> V_TELESCOPE) & 1UL);
 
                 // ---- packs ----
                 const int numPacks = (ante == 1) ? 4 : 6;
@@ -702,9 +721,8 @@ __kernel void search(
 
                     if (family == PACK_BUFFOON) {
 #if WANT_JOKERS
+                        // No duplicate prevention (the player may hold Showman).
                         if (passFlags & ST_JOKERS) {
-                        int excluded[8];
-                        int nExcluded = 0;
                         for (int c = 0; c < size && !g.overflow; c++) {
                             const double rv = RND(F_RARITY, SRC_BUF, ante, 0);
                             const int rarity = (rv > 0.95) ? R_RARE : ((rv > 0.7) ? R_UNCOMMON : R_COMMON);
@@ -712,28 +730,12 @@ __kernel void search(
                                             : ((rarity == R_UNCOMMON) ? POOL_N_UNCOMMON : POOL_N_COMMON);
                             const int fam = (rarity == R_RARE) ? F_JOKER3
                                           : ((rarity == R_UNCOMMON) ? F_JOKER2 : F_JOKER1);
-
-                            int idx = rnd_index(RND(fam, SRC_BUF, ante, 0), poolN);
-                            int code = ITEM_CODE(rarity, idx);
-                            int n = 0;
-                            int dup = 1;
-                            while (dup && !g.overflow) {
-                                dup = 0;
-                                for (int e = 0; e < nExcluded; e++) if (excluded[e] == code) { dup = 1; break; }
-                                if (!dup) break;
-                                n++;
-                                if (n >= MAX_RESAMPLE) { g.overflow = 1; break; }
-                                idx = rnd_index(RND(fam, SRC_BUF, ante, n), poolN);
-                                code = ITEM_CODE(rarity, idx);
-                            }
-                            if (g.overflow) break;
-                            if (nExcluded < 8) excluded[nExcluded++] = code;
+                            const int code = ITEM_CODE(rarity, rnd_index(RND(fam, SRC_BUF, ante, 0), poolN));
 
                             int edition = 0;
 #if WANT_EDITIONS
                             if (passFlags & ST_EDITIONS) {
-                                const double ev = RND(F_EDITION, SRC_BUF, ante, 0);
-                                edition = (ev > 0.997) ? 4 : ((ev > 0.994) ? 3 : ((ev > 0.98) ? 2 : ((ev > 0.96) ? 1 : 0)));
+                                edition = poll_edition(RND(F_EDITION, SRC_BUF, ante, 0), edRate, 1.0, 0);
                             }
 #endif
                             jokerSlot++;
@@ -743,56 +745,47 @@ __kernel void search(
 #endif
                     }
                     else if (family == PACK_ARCANA) {
-#if WANT_TAROTS
-                        // The soul roll stays mandatory here: a slot that turns into a Soul
-                        // does not draw a tarot, so skipping it would desync the tarot stream.
-                        if (passFlags & ST_TAROTS) {
-                        int tex[8];
-                        int nTex = 0;
+#if WANT_TAROTS || WANT_SOULS || WANT_SPECTRALS
+                        if (passFlags & (ST_TAROTS | ST_SOULS | ST_SPECTRALS)) {
                         for (int c = 0; c < size && !g.overflow; c++) {
-                            if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
-                                OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
-                                SOUL_FOUND(ante);
+                            // Omen Globe: above 0.8 on its run-long stream, the slot is a
+                            // soulable Spectral card instead of a Tarot.
+                            if (omenGlobe && RND(F_OMEN_GLOBE, 0, 0, 0) > 0.8) {
+                                SPECTRAL_SLOT(ante, SRC_AR2, c + 1);
                                 continue;
                             }
-                            int idx = rnd_index(RND(F_TAROT, SRC_AR1, ante, 0), POOL_N_TAROTS);
-                            int code = TAROT_BASE | idx;
-                            int n = 0;
-                            int dup = 1;
-                            while (dup) {
-                                dup = 0;
-                                for (int e = 0; e < nTex; e++) if (tex[e] == code) { dup = 1; break; }
-                                if (!dup) break;
-                                n++;
-                                if (n >= MAX_RESAMPLE) { g.overflow = 1; break; }
-                                idx = rnd_index(RND(F_TAROT, SRC_AR1, ante, n), POOL_N_TAROTS);
-                                code = TAROT_BASE | idx;
+#if WANT_TAROTS
+                            // The soul roll stays mandatory when tarots are wanted: a slot that
+                            // turns into a Soul draws no tarot, so skipping it would desync
+                            // the tarot stream.
+                            if (passFlags & ST_TAROTS) {
+                                if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
+                                    OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
+                                    SOUL_FOUND(ante);
+                                } else {
+                                    const int tIdx = rnd_index(RND(F_TAROT, SRC_AR1, ante, 0), POOL_N_TAROTS);
+                                    OFFER(TAROT_BASE | tIdx, 0, ante, c + 1, SB_PACK);
+                                }
+                                continue;
                             }
-                            if (g.overflow) break;
-                            if (nTex < 8) tex[nTex++] = code;
-                            OFFER(code, 0, ante, c + 1, SB_PACK);
-                        }
-                        } else
 #endif
-                        {
-#if WANT_SOULS
                             if (passFlags & ST_SOULS) {
-                                for (int c = 0; c < size && !g.overflow; c++) {
-                                    if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
-                                        OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
-                                        SOUL_FOUND(ante);
-                                    }
+                                if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
+                                    OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
+                                    SOUL_FOUND(ante);
                                 }
                             }
-#endif
                         }
+                        }
+#endif
                     }
 #if WANT_SOULS || WANT_SPECTRALS
                     else if (family == PACK_CELESTIAL) {
 #if WANT_SOULS
-                        // Celestial packs can only substitute Black Hole, never a Soul.
+                        // Celestial packs can only substitute Black Hole, never a Soul. With
+                        // Telescope the first card is a forced planet and rolls nothing.
                         if (passFlags & ST_SOULS) {
-                            for (int c = 0; c < size && !g.overflow; c++) {
+                            for (int c = telescope ? 1 : 0; c < size && !g.overflow; c++) {
                                 if (RND(F_SOUL_PLANET, 0, ante, 0) > 0.997) {
                                     OFFER(CODE_BLACK_HOLE, 0, ante, c + 1, SB_PACK);
                                 }
@@ -801,17 +794,10 @@ __kernel void search(
 #endif
                     }
                     else if (family == PACK_SPECTRAL) {
-#if WANT_SPECTRALS
-                        if (passFlags & ST_SPECTRALS) {
-                            SCAN_SPECTRAL_FULL(ante, size);
-                        } else
-#endif
-                        {
-#if WANT_SOULS
-                            if (passFlags & ST_SOULS) {
-                                SCAN_SPECTRAL_SOULS(ante, size);
+                        if (passFlags & (ST_SOULS | ST_SPECTRALS)) {
+                            for (int c = 0; c < size && !g.overflow; c++) {
+                                SPECTRAL_SLOT(ante, SRC_SPE, c + 1);
                             }
-#endif
                         }
                     }
 #endif
@@ -846,18 +832,20 @@ __kernel void search(
                             if (bound <= cutoff) { abandoned = 1; break; }
                         }
 
-                        double roll = RNDR(scid[SS_CDT], &sCdt) * rateTotal;
-                        int type;
-                        if (roll < rate0) type = 0;
-                        else {
-                            roll -= rate0;
-                            if (roll < rate1) type = 1;
-                            else {
-                                roll -= rate1;
-                                if (roll < rate2) type = 2;
-                                else { roll -= rate2; type = (roll < rate3) ? 3 : 4; }
-                            }
-                        }
+                        // The ante's first shop deals its opening cards before its voucher
+                        // can be bought, so those slots use the rates from before it.
+                        const int early = slot <= entryShop;
+                        const double r0 = early ? pRate0 : rate0;
+                        const double r1 = early ? pRate1 : rate1;
+                        const double r2 = early ? pRate2 : rate2;
+                        const double r3 = early ? pRate3 : rate3;
+                        const double slotEdRate = early ? pEdRate : edRate;
+
+                        // The game's own test, taking the types in order: polled is at or
+                        // below the running total of rates.
+                        const double c0 = r0, c1 = c0 + r1, c2 = c1 + r2, c3 = c2 + r3;
+                        const double polled = RNDR(scid[SS_CDT], &sCdt) * (r0 + r1 + r2 + r3 + 0.0);
+                        const int type = (polled <= c0) ? 0 : ((polled <= c1) ? 1 : ((polled <= c2) ? 2 : ((polled <= c3) ? 3 : 4)));
 
                         if (type == 0) {
 #if WANT_JOKERS
@@ -876,10 +864,7 @@ __kernel void search(
 
                             int edition = 0;
 #if WANT_EDITIONS
-                            {
-                                const double ev = RNDR(scid[SS_EDITION], &sEdi);
-                                edition = (ev > 0.997) ? 4 : ((ev > 0.994) ? 3 : ((ev > 0.98) ? 2 : ((ev > 0.96) ? 1 : 0)));
-                            }
+                            edition = poll_edition(RNDR(scid[SS_EDITION], &sEdi), slotEdRate, 1.0, 0);
 #endif
                             OFFER(code, edition, ante, slot, SB_SHOP);
 #endif

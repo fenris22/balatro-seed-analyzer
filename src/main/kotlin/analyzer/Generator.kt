@@ -65,6 +65,21 @@ object PoolArr {    val COMMON_JOKERS = Pools.COMMON_JOKERS.toTypedArray()
     val V_PLANET_MERCHANT = Pools.VOUCHERS.indexOfFirst { it.id == "Planet_Merchant" }
     val V_MAGIC_TRICK = Pools.VOUCHERS.indexOfFirst { it.id == "Magic_Trick" }
 
+    /** Vouchers that change generation in other ways. */
+    val V_HONE = Pools.VOUCHERS.indexOfFirst { it.id == "Hone" }
+    val V_GLOW_UP = Pools.VOUCHERS.indexOfFirst { it.id == "Glow_Up" }
+    val V_OMEN_GLOBE = Pools.VOUCHERS.indexOfFirst { it.id == "Omen_Globe" }
+    val V_TELESCOPE = Pools.VOUCHERS.indexOfFirst { it.id == "Telescope" }
+    val V_OVERSTOCK = Pools.VOUCHERS.indexOfFirst { it.id == "Overstock" }
+    val V_OVERSTOCK_PLUS = Pools.VOUCHERS.indexOfFirst { it.id == "Overstock_Plus" }
+
+    init {
+        for (v in intArrayOf(V_TAROT_TYCOON, V_TAROT_MERCHANT, V_PLANET_TYCOON, V_PLANET_MERCHANT, V_MAGIC_TRICK,
+            V_HONE, V_GLOW_UP, V_OMEN_GLOBE, V_TELESCOPE, V_OVERSTOCK, V_OVERSTOCK_PLUS)) {
+            require(v >= 0) { "a voucher the generator depends on is missing from Pools.VOUCHERS" }
+        }
+    }
+
     val TAG_GATED = BooleanArray(Pools.TAGS.size) { Pools.TAGS[it].id in Pools.TAG_ANTE_GATE }
 }
 
@@ -263,11 +278,19 @@ object Placeholder {
     val PLAYING_CARD = Item("PLAYING_CARD", "Playing Card")
     val THE_SOUL = Item("The_Soul", "The Soul")
     val BLACK_HOLE = Item("Black_Hole", "Black Hole")
+    /** Telescope's forced first Celestial card: whatever your most-played hand's planet is. */
+    val TELESCOPE_PLANET = Item("Telescope_Planet", "Planet for your most played hand (Telescope)")
 }
 
 /**
- * Assumptions (see README): White Stake, Red Deck, no Showman, every voucher offered is
- * assumed bought immediately (except for vouchers in [ignoredVouchers]), nothing treated as "not yet discovered".
+ * Assumptions: White Stake, Red Deck, every voucher offered is bought as soon as it appears
+ * (except vouchers in [ignoredVouchers]), nothing treated as "not yet discovered".
+ *
+ * Duplicates: the game stops a card from appearing while an identical one is on screen or
+ * owned, unless you hold Showman. Shop and pack cards are generated without that check (as
+ * with Showman), since what is on screen depends on how you play. Souls are the exception:
+ * every legendary a Soul hands out is assumed kept and Showman never held, so a later Soul
+ * rerolls any legendary already taken.
  *
  * Reusable: call [reset] with a new seed instead of constructing a new instance.
  */
@@ -287,28 +310,43 @@ class SeedAnalyzer(
     private val usedNormalBosses = HashSet<String>()
     private val usedFinisherBosses = HashSet<String>()
 
-    /** Shop rates are constant within an ante, so they are computed once per ante. */
+    /**
+     * Shop rates and edition rate, twice over.
+     *
+     * Each ante's first shop deals its opening cards before that ante's voucher can be
+     * bought, so those cards -- the first [entryShopSize] shop slots -- use the rates from
+     * before the voucher ([prevRates], [prevEditionRate]). Every later slot, and every pack,
+     * is assumed to come after buying it and uses [rates] / [editionRate].
+     */
     private val rates = DoubleArray(5)
     private var rateTotal = 0.0
+    private val prevRates = DoubleArray(5)
+    private var prevRateTotal = 0.0
+    private var editionRate = 1.0
+    private var prevEditionRate = 1.0
+    private var entryShopSize = 2
 
-    /**
-     * Per-pack duplicate suppression. Pool entries are singletons, so identity comparison
-     * over a tiny array beats hashing the id String on every draw.
-     */
-    private val excluded = arrayOfNulls<Item>(8)
-    private var excludedCount = 0
-
-    /** Legendary jokers already handed out this run, and how many Souls have appeared. */
-    private val legendaryTaken = BooleanArray(PoolArr.LEGENDARY_JOKERS.size)
+    /** How many Souls have appeared this run; the n'th Soul is "slot n" for a condition. */
     private var soulCount = 0
 
     /**
-     * Set when a resample loop cannot terminate, e.g. a sixth Soul when all five legendary
-     * jokers are already held. The GPU escapes these by flagging the seed and punting it
-     * here; without a matching bound this side simply spins, which is exactly what it did.
+     * Set when a resample loop cannot terminate. The GPU escapes these by flagging the seed
+     * and punting it here; without a matching bound this side would simply spin.
      * Callers must check [aborted] and drop the seed.
      */
     private var resampleOverflow = false
+
+    /** Why the last seed could not be resolved; shown in the end-of-run punt list. */
+    var abortReason: String? = null
+        private set
+
+    private fun overflow(reason: String) {
+        resampleOverflow = true
+        if (abortReason == null) abortReason = reason
+    }
+
+    /** Legendaries already handed out this run; a later Soul rerolls these. */
+    private val legendaryTaken = BooleanArray(PoolArr.LEGENDARY_JOKERS.size)
     private var soulEdition: Item? = null
 
     /** Output of drawJoker, to avoid allocating a ShopItem per joker on the filter path. */
@@ -343,25 +381,14 @@ class SeedAnalyzer(
 
     private fun resetState() {
         resampleOverflow = false
-        java.util.Arrays.fill(voucherActive, false)
+        abortReason = null
         java.util.Arrays.fill(legendaryTaken, false)
+        java.util.Arrays.fill(voucherActive, false)
         usedNormalBosses.clear()
         usedFinisherBosses.clear()
         generatedFirstPack = false
         rateTotal = 0.0
         soulCount = 0
-        excludedCount = 0
-    }
-
-    private fun excludeClear() { excludedCount = 0 }
-
-    private fun isExcluded(item: Item): Boolean {
-        for (i in 0 until excludedCount) if (excluded[i] === item) return true
-        return false
-    }
-
-    private fun exclude(item: Item) {
-        if (excludedCount < excluded.size) excluded[excludedCount++] = item
     }
 
     // --- vouchers ----------------------------------------------------------
@@ -377,7 +404,7 @@ class SeedAnalyzer(
         var idx = rng.randIndex(RngKeys.VOUCHER, 0, ante, 0, n)
         while (voucherLocked(idx)) {
             resample++
-            if (resample >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
+            if (resample >= RESAMPLE_LIMIT) { overflow("voucher reroll never ended (ante $ante)"); break }
             idx = rng.randIndex(RngKeys.VOUCHER, 0, ante, resample, n)
         }
         if (!voucherIgnored[idx]) {
@@ -387,20 +414,32 @@ class SeedAnalyzer(
         return PoolArr.VOUCHERS[idx]
     }
 
-    private fun updateShopRates() {
+    /** Shop card-type rates for the vouchers currently owned; returns their total. */
+    private fun fillShopRates(out: DoubleArray): Double {
         var tarotRate = 4.0
         var planetRate = 4.0
         if (voucherActive[PoolArr.V_TAROT_TYCOON]) tarotRate = 32.0
         else if (voucherActive[PoolArr.V_TAROT_MERCHANT]) tarotRate = 9.6
         if (voucherActive[PoolArr.V_PLANET_TYCOON]) planetRate = 32.0
         else if (voucherActive[PoolArr.V_PLANET_MERCHANT]) planetRate = 9.6
-        rates[0] = 20.0
-        rates[1] = tarotRate
-        rates[2] = planetRate
-        rates[3] = if (voucherActive[PoolArr.V_MAGIC_TRICK]) 4.0 else 0.0
-        rates[4] = 0.0
-        rateTotal = rates[0] + rates[1] + rates[2] + rates[3] + rates[4]
+        out[0] = 20.0
+        out[1] = tarotRate
+        out[2] = planetRate
+        out[3] = if (voucherActive[PoolArr.V_MAGIC_TRICK]) 4.0 else 0.0
+        out[4] = 0.0
+        return out[0] + out[1] + out[2] + out[3] + out[4]
     }
+
+    /** G.GAME.edition_rate: Hone sets it to 2, Glow Up to 4. Negative is never affected. */
+    private fun currentEditionRate(): Double = when {
+        voucherActive[PoolArr.V_GLOW_UP] -> 4.0
+        voucherActive[PoolArr.V_HONE] -> 2.0
+        else -> 1.0
+    }
+
+    /** Shop joker slots: 2, plus one each for Overstock and Overstock Plus. */
+    private fun currentShopSize(): Int =
+        2 + (if (voucherActive[PoolArr.V_OVERSTOCK]) 1 else 0) + (if (voucherActive[PoolArr.V_OVERSTOCK_PLUS]) 1 else 0)
 
     // --- bosses and tags ---------------------------------------------------
 
@@ -441,97 +480,56 @@ class SeedAnalyzer(
         }
     }
 
-    private fun nextJokerEdition(ante: Int, srcId: Int): Item? {
+    private fun nextJokerEdition(ante: Int, srcId: Int, rate: Double): Item? {
         if (!detail.editions) return null
-        val poll = rng.random(RngKeys.EDITION, srcId, ante, 0)
-        return when {
-            poll > 0.997 -> Pools.EDITIONS[4]
-            poll > 0.994 -> Pools.EDITIONS[3]
-            poll > 0.98 -> Pools.EDITIONS[2]
-            poll > 0.96 -> Pools.EDITIONS[1]
-            else -> null
-        }
+        return pollEdition(rng.random(RngKeys.EDITION, srcId, ante, 0), rate, 1.0, noNeg = false)
     }
 
     /** Writes into jokerItem / jokerRarity / jokerEdition rather than returning an object. */
-    private fun drawJoker(ante: Int, srcId: Int, useExcluded: Boolean) {
+    private fun drawJoker(ante: Int, srcId: Int, edRate: Double) {
         val rarity = nextJokerRarity(ante, srcId)
-        val pool = JOKER_POOLS[rarity]
-        val family = JOKER_FAMILIES[rarity]
-        // Legendary jokers key off a single run-long stream, ignoring source and ante.
-        val legendary = rarity == R_LEGENDARY
-        val keySrc = if (legendary) 0 else srcId
-        val keyAnte = if (legendary) 0 else ante
-
-        var joker = rng.randChoice(family, keySrc, keyAnte, 0, pool)
-        if (useExcluded) {
-            var n = 0
-            while (isExcluded(joker)) {
-                n++
-                if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
-                joker = rng.randChoice(family, keySrc, keyAnte, n, pool)
-            }
-            exclude(joker)
-        }
-        jokerItem = joker
+        jokerItem = rng.randChoice(JOKER_FAMILIES[rarity], srcId, ante, 0, JOKER_POOLS[rarity])
         jokerRarity = rarity
-        jokerEdition = nextJokerEdition(ante, srcId)
+        jokerEdition = nextJokerEdition(ante, srcId, edRate)
     }
 
     /**
      * The legendary joker the next Soul hands out.
      *
-     * The Joker4 stream carries no source or ante, so it is one queue for the whole run:
-     * the first Soul consumed takes the first entry, the second takes the next, and so
-     * on. Without Showman a joker you already hold cannot come up again, which is what
-     * the resample loop models -- the same shape the original code used for legendary
-     * draws. Verify that against Immolate if exact duplicate handling matters to you;
-     * it only bites on a seed with two or more Souls.
+     * The game creates it with create_card('Joker', ..., legendary = true, key_append 'sou'),
+     * which draws from pool key "Joker4" -- no source, no ante -- so it is one queue for the
+     * whole run. Without Showman a legendary already held is unavailable, so the roll is
+     * repeated on "Joker4_resample2", "_resample3", ... until it lands on one not yet taken.
      *
-     * Editions on Soul jokers are not modelled. If you need to search for a Negative
-     * Perkeo, the edition roll goes here, and you will need its key confirmed first.
+     * A Soul that appears once all five are held has nothing left to roll. The game falls
+     * back to a plain Joker there, but that is left as an unresolvable seed for now so it
+     * shows up in the punt list.
      */
     private fun nextSoulJoker(ante: Int): Item {
         val pool = PoolArr.LEGENDARY_JOKERS
-        var n = 0
         var idx = rng.randIndex(RngKeys.JOKER4, 0, 0, 0, pool.size)
-        // With only five legendary jokers, a run that turns up a sixth Soul has nothing
-        // left to give: every index is taken and this condition can never clear. Whether
-        // the game repeats a legendary at that point is a modelling question worth
-        // settling, but it must not be an infinite loop either way.
-        while (legendaryTaken[idx]) {
-            n++
-            if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
-            idx = rng.randIndex(RngKeys.JOKER4, 0, 0, n, pool.size)
+        if (legendaryTaken.all { it }) {
+            overflow("Soul #$soulCount in ante $ante, with all five legendaries already held")
+        } else {
+            var n = 0
+            while (legendaryTaken[idx]) {
+                n++
+                if (n >= RESAMPLE_LIMIT) { overflow("legendary reroll never ended (ante $ante)"); break }
+                idx = rng.randIndex(RngKeys.JOKER4, 0, 0, n, pool.size)
+            }
+            legendaryTaken[idx] = true
         }
-        legendaryTaken[idx] = true
         soulEdition = soulJokerEdition(ante)
         return pool[idx]
     }
 
     /**
-     * Edition for a Soul joker.
-     *
-     * Balatro builds the legendary joker with key_append "sou", so this rolls on
-     * "edisou<ante>" -- its own stream, shared with nothing, which is why switching it on
-     * cannot shift any other result. The thresholds are the same as for any other joker.
-     *
-     * Worth confirming against Immolate before you trust a Negative Perkeo hit: the pool
-     * draw above uses a bare "Joker4" key with no source or ante, which is the convention
-     * this codebase already carried, and the two ought to agree about whether the append
-     * applies. If Immolate appends there too, both this and nextSoulJoker need the source
-     * and ante added.
+     * Edition for a Soul joker: poll_edition on "edisou<ante>", with the same thresholds and
+     * edition rate as any other joker. Confirmed against the game source.
      */
     private fun soulJokerEdition(ante: Int): Item? {
         if (!detail.editions) return null
-        val poll = rng.random(RngKeys.EDITION, RngKeys.SRC_SOU, ante, 0)
-        return when {
-            poll > 0.997 -> Pools.EDITIONS[4]
-            poll > 0.994 -> Pools.EDITIONS[3]
-            poll > 0.98 -> Pools.EDITIONS[2]
-            poll > 0.96 -> Pools.EDITIONS[1]
-            else -> null
-        }
+        return pollEdition(rng.random(RngKeys.EDITION, RngKeys.SRC_SOU, ante, 0), editionRate, 1.0, noNeg = false)
     }
 
     /** Called for each Soul as it is found, in encounter order. */
@@ -545,37 +543,17 @@ class SeedAnalyzer(
 
     // --- consumables -------------------------------------------------------
 
-    private fun nextTarot(ante: Int, srcId: Int, soulable: Boolean, useExcluded: Boolean): Item {
+    private fun nextTarot(ante: Int, srcId: Int, soulable: Boolean): Item {
         if (soulable && rng.random(RngKeys.SOUL_TAROT, 0, ante, 0) > 0.997) return Placeholder.THE_SOUL
-        var item = rng.randChoice(RngKeys.TAROT, srcId, ante, 0, PoolArr.TAROTS)
-        if (useExcluded) {
-            var n = 0
-            while (isExcluded(item)) {
-                n++
-                if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
-                item = rng.randChoice(RngKeys.TAROT, srcId, ante, n, PoolArr.TAROTS)
-            }
-            exclude(item)
-        }
-        return item
+        return rng.randChoice(RngKeys.TAROT, srcId, ante, 0, PoolArr.TAROTS)
     }
 
-    private fun nextPlanet(ante: Int, srcId: Int, soulable: Boolean, useExcluded: Boolean): Item {
+    private fun nextPlanet(ante: Int, srcId: Int, soulable: Boolean): Item {
         if (soulable && rng.random(RngKeys.SOUL_PLANET, 0, ante, 0) > 0.997) return Placeholder.BLACK_HOLE
-        var item = rng.randChoice(RngKeys.PLANET, srcId, ante, 0, PoolArr.PLANETS)
-        if (useExcluded) {
-            var n = 0
-            while (isExcluded(item)) {
-                n++
-                if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
-                item = rng.randChoice(RngKeys.PLANET, srcId, ante, n, PoolArr.PLANETS)
-            }
-            exclude(item)
-        }
-        return item
+        return rng.randChoice(RngKeys.PLANET, srcId, ante, 0, PoolArr.PLANETS)
     }
 
-    /** The two soul rolls, in order. Black Hole wins if both hit, as in the original. */
+    /** The two soul rolls, in order. Black Hole wins if both hit, as in the game. */
     private fun spectralSubstitution(ante: Int): Item? {
         var forced: Item? = null
         if (rng.random(RngKeys.SOUL_SPECTRAL, 0, ante, 0) > 0.997) forced = Placeholder.THE_SOUL
@@ -583,16 +561,20 @@ class SeedAnalyzer(
         return forced
     }
 
-    private fun nextSpectral(ante: Int, srcId: Int, soulable: Boolean, useExcluded: Boolean): Item {
+    /**
+     * The Soul and Black Hole sit in the spectral pool but are always unavailable there --
+     * even with Showman -- so landing on one rerolls ("RETRY" in the pool list). That is
+     * the one resample left for spectrals.
+     */
+    private fun nextSpectral(ante: Int, srcId: Int, soulable: Boolean): Item {
         if (soulable) spectralSubstitution(ante)?.let { return it }
         var item = rng.randChoice(RngKeys.SPECTRAL, srcId, ante, 0, PoolArr.SPECTRALS)
         var n = 0
-        while (item.id == "RETRY" || (useExcluded && isExcluded(item))) {
+        while (item.id == "RETRY") {
             n++
-            if (n >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
+            if (n >= RESAMPLE_LIMIT) { overflow("spectral reroll never ended (ante $ante)"); break }
             item = rng.randChoice(RngKeys.SPECTRAL, srcId, ante, n, PoolArr.SPECTRALS)
         }
-        if (useExcluded) exclude(item)
         return item
     }
 
@@ -604,13 +586,8 @@ class SeedAnalyzer(
 
         val base = rng.randChoice(RngKeys.FRONTSTA, 0, ante, 0, PoolArr.CARDS)
 
-        val v = rng.random(RngKeys.STD_EDITION, 0, ante, 0)
-        val edition = when {
-            v > 0.988 -> Pools.EDITIONS[3]
-            v > 0.96 -> Pools.EDITIONS[2]
-            v > 0.92 -> Pools.EDITIONS[1]
-            else -> null
-        }
+        // poll_edition(..., 2, true): double the base odds, never Negative.
+        val edition = pollEdition(rng.random(RngKeys.STD_EDITION, 0, ante, 0), editionRate, 2.0, noNeg = true)
 
         val seal = if (rng.random(RngKeys.STDSEAL, 0, ante, 0) <= 0.8) null else {
             val s = rng.random(RngKeys.STDSEALTYPE, 0, ante, 0)
@@ -629,7 +606,6 @@ class SeedAnalyzer(
     /**
      * Cumulative weights are precomputed, so this is a scan over a DoubleArray rather
      * than re-summing PackKind.weight through a field load on every pack of every ante.
-     * The accumulation order is unchanged, so the partial sums are bit-identical.
      */
     private fun nextPackKind(ante: Int): Pools.PackKind {
         if (ante <= 2 && !generatedFirstPack) {
@@ -643,24 +619,43 @@ class SeedAnalyzer(
     }
 
     /**
-     * Souls-only Arcana: the substitution roll lives on its own stream (SOUL_TAROT),
-     * separate from the tarot choice (TAROT), so when no tarot is being searched for we
-     * can roll the first and never touch the second. That is one draw per slot instead
-     * of one plus a choice plus any duplicate resamples.
+     * A soulable Spectral card in a pack slot: a Spectral pack's own card, or one that
+     * Omen Globe put into an Arcana pack ([srcId] SRC_AR2).
+     */
+    private fun spectralSlot(ante: Int, srcId: Int, slot: Int, family: String, sink: ScanSink) {
+        if (detail.spectrals) {
+            val item = nextSpectral(ante, srcId, soulable = true)
+            sink.onPackConsumable(ante, slot, family, item)
+            if (item === Placeholder.THE_SOUL) onSoulFound(ante, sink)
+        } else if (detail.souls) {
+            val forced = spectralSubstitution(ante) ?: return
+            sink.onPackConsumable(ante, slot, family, forced)
+            if (forced === Placeholder.THE_SOUL) onSoulFound(ante, sink)
+        }
+    }
+
+    /**
+     * Arcana packs. Without Omen Globe every slot is a soulable Tarot. With it, each slot
+     * first rolls "omen_globe" (one stream for the whole run) and above 0.8 becomes a
+     * soulable Spectral card on "Spectralar2<ante>" instead -- which rolls for the Soul on
+     * the Spectral soul stream, not the Tarot one.
      *
-     * Note the asymmetry: when tarots *are* wanted the soul roll is mandatory, because a
-     * slot that turns into a Soul does not draw a tarot, so skipping it would desync the
-     * tarot stream.
+     * When tarots are wanted the Tarot slot's soul roll is mandatory: a slot that turns into
+     * a Soul draws no tarot, so skipping the roll would desync the tarot stream.
      */
     private fun scanArcana(ante: Int, size: Int, sink: ScanSink) {
-        if (detail.tarots) {
-            for (i in 0 until size) {
-                val item = nextTarot(ante, RngKeys.SRC_AR1, soulable = true, useExcluded = true)
+        if (!detail.tarots && !detail.spectrals && !detail.souls) return
+        val omen = voucherActive[PoolArr.V_OMEN_GLOBE]
+        for (i in 0 until size) {
+            if (omen && rng.random(RngKeys.OMEN_GLOBE, 0, 0, 0) > 0.8) {
+                spectralSlot(ante, RngKeys.SRC_AR2, i + 1, "Arcana", sink)
+                continue
+            }
+            if (detail.tarots) {
+                val item = nextTarot(ante, RngKeys.SRC_AR1, soulable = true)
                 sink.onPackConsumable(ante, i + 1, "Arcana", item)
                 if (item === Placeholder.THE_SOUL) onSoulFound(ante, sink)
-            }
-        } else if (detail.souls) {
-            for (i in 0 until size) {
+            } else if (detail.souls) {
                 if (rng.random(RngKeys.SOUL_TAROT, 0, ante, 0) > 0.997) {
                     sink.onPackConsumable(ante, i + 1, "Arcana", Placeholder.THE_SOUL)
                     onSoulFound(ante, sink)
@@ -669,35 +664,30 @@ class SeedAnalyzer(
         }
     }
 
+    /**
+     * Celestial packs. With Telescope, the first card is the planet for your most-played
+     * hand: a forced card, so it draws nothing -- no Black Hole roll, no planet choice.
+     * Which planet that is depends on how you play, so it is reported as a placeholder.
+     */
     private fun scanCelestial(ante: Int, size: Int, sink: ScanSink) {
-        if (detail.planets) {
-            for (i in 0 until size) {
-                sink.onPackConsumable(ante, i + 1, "Celestial", nextPlanet(ante, RngKeys.SRC_PL1, true, true))
+        if (!detail.planets && !detail.souls) return
+        val telescope = voucherActive[PoolArr.V_TELESCOPE]
+        for (i in 0 until size) {
+            if (telescope && i == 0) {
+                if (detail.planets) sink.onPackConsumable(ante, 1, "Celestial", Placeholder.TELESCOPE_PLANET)
+                continue
             }
-        } else if (detail.souls) {
-            // Celestial packs can only substitute Black Hole, never a Soul.
-            for (i in 0 until size) {
-                if (rng.random(RngKeys.SOUL_PLANET, 0, ante, 0) > 0.997) {
-                    sink.onPackConsumable(ante, i + 1, "Celestial", Placeholder.BLACK_HOLE)
-                }
+            if (detail.planets) {
+                sink.onPackConsumable(ante, i + 1, "Celestial", nextPlanet(ante, RngKeys.SRC_PL1, true))
+            } else if (rng.random(RngKeys.SOUL_PLANET, 0, ante, 0) > 0.997) {
+                // Celestial packs can only substitute Black Hole, never a Soul.
+                sink.onPackConsumable(ante, i + 1, "Celestial", Placeholder.BLACK_HOLE)
             }
         }
     }
 
     private fun scanSpectral(ante: Int, size: Int, sink: ScanSink) {
-        if (detail.spectrals) {
-            for (i in 0 until size) {
-                val item = nextSpectral(ante, RngKeys.SRC_SPE, soulable = true, useExcluded = true)
-                sink.onPackConsumable(ante, i + 1, "Spectral", item)
-                if (item === Placeholder.THE_SOUL) onSoulFound(ante, sink)
-            }
-        } else if (detail.souls) {
-            for (i in 0 until size) {
-                val forced = spectralSubstitution(ante) ?: continue
-                sink.onPackConsumable(ante, i + 1, "Spectral", forced)
-                if (forced === Placeholder.THE_SOUL) onSoulFound(ante, sink)
-            }
-        }
+        for (i in 0 until size) spectralSlot(ante, RngKeys.SRC_SPE, i + 1, "Spectral", sink)
     }
 
     // --- the scan ----------------------------------------------------------
@@ -705,10 +695,10 @@ class SeedAnalyzer(
     /**
      * Generates one ante, pushing everything into [sink] as it goes.
      *
-     * Packs are emitted before the shop even though the original generated the shop
-     * first. That reordering is free -- every card type draws from its own keyed stream,
-     * so no value depends on when it is drawn relative to another type -- and it puts the
-     * expensive part last, where [ScanSink.wantMoreShop] can cut it short.
+     * Packs are emitted before the shop even though the game deals the shop first. That
+     * reordering is free -- every card type draws from its own keyed stream, so no value
+     * depends on when it is drawn relative to another type -- and it puts the expensive
+     * part last, where [ScanSink.wantMoreShop] can cut it short.
      *
      * Returns the number of shop slots actually generated, for instrumentation.
      */
@@ -721,8 +711,14 @@ class SeedAnalyzer(
         val boss = nextBoss(ante)
         if (detail.bosses) sink.onBoss(ante, boss)
 
-        // Never skippable: it feeds voucherActive, which sets the shop rates, which move
-        // the cdt thresholds for every shop slot in this ante and every later one.
+        // What the ante's first shop deals its opening cards with: the vouchers owned
+        // before this ante's voucher is offered.
+        prevRateTotal = fillShopRates(prevRates)
+        prevEditionRate = currentEditionRate()
+        entryShopSize = currentShopSize()
+
+        // Never skippable: it feeds voucherActive, which sets the shop and edition rates
+        // and whether Omen Globe and Telescope are in play.
         sink.onVoucher(ante, nextVoucher(ante))
 
         if (detail.tags) {
@@ -732,24 +728,24 @@ class SeedAnalyzer(
                 var idx = rng.randIndex(RngKeys.TAG, 0, ante, 0, n)
                 while (PoolArr.TAG_GATED[idx] && ante < 2) {
                     r++
-                    if (r >= RESAMPLE_LIMIT) { resampleOverflow = true; break }
+                    if (r >= RESAMPLE_LIMIT) { overflow("tag reroll never ended (ante $ante)"); break }
                     idx = rng.randIndex(RngKeys.TAG, 0, ante, r, n)
                 }
                 sink.onTag(ante, which, PoolArr.TAGS[idx])
             }
         }
 
-        updateShopRates()
+        rateTotal = fillShopRates(rates)
+        editionRate = currentEditionRate()
 
         var jokerSlot = 0
         for (p in 0 until numPacks) {
             val kind = nextPackKind(ante)
             sink.onPackKind(ante, p, kind)
-            excludeClear()
             when (kind.family) {
                 "Buffoon" -> if (detail.jokers) {
                     for (i in 0 until kind.size) {
-                        drawJoker(ante, RngKeys.SRC_BUF, useExcluded = true)
+                        drawJoker(ante, RngKeys.SRC_BUF, editionRate)
                         jokerSlot++
                         sink.onPackJoker(ante, jokerSlot, jokerItem, RARITY_NAMES[jokerRarity], jokerEdition)
                     }
@@ -768,36 +764,37 @@ class SeedAnalyzer(
             if (!sink.wantMoreShop(ante, slot)) break
             generated++
 
-            var roll = rng.random(RngKeys.CDT, 0, ante, 0) * rateTotal
-            val type: Int
-            if (roll < rates[0]) type = 0
-            else {
-                roll -= rates[0]
-                if (roll < rates[1]) type = 1
-                else {
-                    roll -= rates[1]
-                    if (roll < rates[2]) type = 2
-                    else {
-                        roll -= rates[2]
-                        type = if (roll < rates[3]) 3 else 4
-                    }
-                }
+            // The first shop's opening cards come before the voucher can be bought.
+            val early = slot <= entryShopSize
+            val r = if (early) prevRates else rates
+            val edRate = if (early) prevEditionRate else editionRate
+
+            // The game's own test: polled > running total and <= running total + rate,
+            // taking the types in order.
+            val polled = rng.random(RngKeys.CDT, 0, ante, 0) * (if (early) prevRateTotal else rateTotal)
+            val c0 = r[0]; val c1 = c0 + r[1]; val c2 = c1 + r[2]; val c3 = c2 + r[3]
+            val type = when {
+                polled <= c0 -> 0
+                polled <= c1 -> 1
+                polled <= c2 -> 2
+                polled <= c3 -> 3
+                else -> 4
             }
 
             when (type) {
                 0 -> if (detail.jokers) {
-                    drawJoker(ante, RngKeys.SRC_SHO, useExcluded = false)
+                    drawJoker(ante, RngKeys.SRC_SHO, edRate)
                     sink.onShopItem(ante, slot, "Joker", jokerItem, RARITY_NAMES[jokerRarity], jokerEdition)
                 } else sink.onShopItem(ante, slot, "Skipped", Placeholder.ITEM, null, null)
                 1 -> if (detail.tarots) {
-                    sink.onShopItem(ante, slot, "Tarot", nextTarot(ante, RngKeys.SRC_SHO, false, false), null, null)
+                    sink.onShopItem(ante, slot, "Tarot", nextTarot(ante, RngKeys.SRC_SHO, false), null, null)
                 } else sink.onShopItem(ante, slot, "Skipped", Placeholder.ITEM, null, null)
                 2 -> if (detail.planets) {
-                    sink.onShopItem(ante, slot, "Planet", nextPlanet(ante, RngKeys.SRC_SHO, false, false), null, null)
+                    sink.onShopItem(ante, slot, "Planet", nextPlanet(ante, RngKeys.SRC_SHO, false), null, null)
                 } else sink.onShopItem(ante, slot, "Skipped", Placeholder.ITEM, null, null)
                 3 -> sink.onShopItem(ante, slot, "PlayingCard", Placeholder.PLAYING_CARD, null, null)
                 else -> if (detail.spectrals) {
-                    sink.onShopItem(ante, slot, "Spectral", nextSpectral(ante, RngKeys.SRC_SHO, false, false), null, null)
+                    sink.onShopItem(ante, slot, "Spectral", nextSpectral(ante, RngKeys.SRC_SHO, false), null, null)
                 } else sink.onShopItem(ante, slot, "Skipped", Placeholder.ITEM, null, null)
             }
         }
@@ -810,4 +807,19 @@ class SeedAnalyzer(
         scanAnte(ante, numShopItems, reportSink, numPacks)
         return reportSink.finish(ante)
     }
+}
+
+/**
+ * poll_edition from the game, in its exact arithmetic.
+ *
+ * [rate] is G.GAME.edition_rate (1, or 2 with Hone, 4 with Glow Up). Negative ignores it --
+ * the game writes that threshold as 1 - 0.003*mod -- so Negative odds never change.
+ * [mod] is 2 for standard-pack cards, which also pass [noNeg].
+ */
+fun pollEdition(poll: Double, rate: Double, mod: Double, noNeg: Boolean): Item? = when {
+    !noNeg && poll > 1 - 0.003 * mod -> Pools.EDITIONS[4]
+    poll > 1 - 0.006 * rate * mod -> Pools.EDITIONS[3]
+    poll > 1 - 0.02 * rate * mod -> Pools.EDITIONS[2]
+    poll > 1 - 0.04 * rate * mod -> Pools.EDITIONS[1]
+    else -> null
 }

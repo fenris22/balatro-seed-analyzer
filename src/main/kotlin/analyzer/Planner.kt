@@ -27,6 +27,21 @@ class PrefilterStage(
     /** Estimated work per seed, in draw-equivalents. */
     val cost: Double,
 ) {
+    /**
+     * True if this stage's pack contents depend on which vouchers are owned, so the GPU
+     * stage has to generate vouchers too (about one draw per ante). Soul, tarot and
+     * spectral contents do (Omen Globe, Telescope); so do editions other than Negative
+     * (Hone and Glow Up). A Buffoon-only stage looking for Negatives does not.
+     */
+    fun needsVouchers(conditions: Array<Condition>): Boolean {
+        if (detail.souls || detail.tarots || detail.spectrals || detail.planets) return true
+        if (!detail.editions) return false
+        return condIndex.any { i ->
+            val t = conditions[i].editionTarget
+            t != null && t.id != "Negative"
+        }
+    }
+
     /** Lower is better: the standard ordering for independent filters. */
     val rank: Double get() = cost / (1.0 - passRate)
 
