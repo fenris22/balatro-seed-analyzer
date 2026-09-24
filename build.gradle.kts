@@ -6,7 +6,8 @@ plugins {
 }
 
 group = "cx.tfe"
-version = "1.0"
+// Set by the release workflow from the git tag (v1.2 -> 1.2). Locally: ./gradlew release -PappVersion=1.2
+version = providers.gradleProperty("appVersion").getOrElse("1.0")
 
 repositories {
     mavenCentral()
@@ -35,9 +36,10 @@ tasks.jar {
     }
 }
 
-// One jar with every dependency inside (JOCL's native library, fastutil, coroutines).
+// One jar with every dependency inside. The JOCL jar already carries its native library
+// for both Linux and Windows, so the same jar works on either.
 tasks.shadowJar {
-    archiveFileName.set("seedfinder-shadow.jar")
+    archiveFileName.set("seedfinder.jar")
     manifest {
         attributes["Main-Class"] = "analyzer.MainKt"
     }
@@ -45,21 +47,23 @@ tasks.shadowJar {
 }
 
 // ---------------------------------------------------------------------------
-// Self-contained Linux bundle: a trimmed Java runtime + the jar + a launcher.
+// Self-contained bundle: a trimmed Java runtime + the jar + a launcher.
 //
-//   ./gradlew bundleRun      -> build/distributions/seedfinder.run  (one file; see below)
-//   ./gradlew bundleTar      -> build/distributions/seedfinder-1.0-linux-x64.tar.gz
-//   ./gradlew bundle         -> the same thing unpacked, in build/bundle/seedfinder
+// The runtime is built for the OS of the machine running Gradle, so the Linux files are
+// built on Linux and the Windows files on Windows (the GitHub workflow does both).
 //
-// On the target machine:
-//   tar xzf seedfinder-1.0-linux-x64.tar.gz
-//   ./seedfinder/bin/seedfinder --chunk 64m
+//   ./gradlew release   -> build/release/ with everything for this OS:
+//        Linux:   seedfinder-<ver>-linux-x64.run      (one self-extracting file)
+//                 seedfinder-<ver>-linux-x64.tar.gz
+//        Windows: seedfinder-<ver>-windows-x64.zip    (unzip, run seedfinder.bat)
 //
-// Nothing needs installing except the GPU's OpenCL driver (ROCm). The runtime is built
-// for the OS and CPU of the machine running Gradle, so build it on x86-64 Linux.
+// Nothing needs installing on the target except the GPU's OpenCL driver.
 // ---------------------------------------------------------------------------
 
 val appName = "seedfinder"
+val isWindows = System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
+val platform = if (isWindows) "windows-x64" else "linux-x64"
+val exe = if (isWindows) ".exe" else ""
 
 /**
  * Java modules the program uses. java.logging is for JOCL; jdk.unsupported is a small
@@ -75,7 +79,7 @@ val toolchainHome = javaToolchains.launcherFor {
 }.map { it.metadata.installationPath }
 
 val runtimeDir = layout.buildDirectory.dir("jlink/runtime")
-val launcherFile = layout.buildDirectory.file("launcher/$appName")
+val launcherDir = layout.buildDirectory.dir("launcher")
 
 val jlinkRuntime = tasks.register<Exec>("jlinkRuntime") {
     group = "distribution"
@@ -87,7 +91,7 @@ val jlinkRuntime = tasks.register<Exec>("jlinkRuntime") {
     val jdk = toolchainHome
     doFirst {
         out.get().deleteRecursively()   // jlink refuses to write into an existing directory
-        executable = jdk.get().file("bin/jlink").asFile.absolutePath
+        executable = jdk.get().file("bin/jlink$exe").asFile.absolutePath
     }
     args(
         "--add-modules", runtimeModules.joinToString(","),
@@ -99,25 +103,50 @@ val jlinkRuntime = tasks.register<Exec>("jlinkRuntime") {
     )
 }
 
+/**
+ * Linux: bin/seedfinder (sh). Windows: seedfinder.bat at the top of the folder, so it is
+ * the obvious thing to double-click. With no arguments the .bat waits for a key at the
+ * end, so a double-clicked window stays open long enough to read the results.
+ */
 val launcherScript = tasks.register("launcherScript") {
     group = "distribution"
-    description = "Writes the bin/seedfinder launcher script."
-    val out = launcherFile
-    outputs.file(out)
+    description = "Writes the launcher for this OS."
+    val out = launcherDir
+    outputs.dir(out)
     doLast {
-        val f = out.get().asFile
-        f.parentFile.mkdirs()
-        f.writeText(
-            """
-            |#!/bin/sh
-            |# Runs the seed finder on the Java runtime bundled next to it; no system Java needed.
-            |# Extra JVM options can go in JAVA_OPTS, e.g. JAVA_OPTS="-Xmx8g" ./bin/seedfinder
-            |APP_HOME="${'$'}(cd "${'$'}(dirname "${'$'}0")/.." && pwd)"
-            |exec "${'$'}APP_HOME/runtime/bin/java" --enable-native-access=ALL-UNNAMED ${'$'}JAVA_OPTS \
-            |    -jar "${'$'}APP_HOME/lib/$appName.jar" "${'$'}@"
-            |""".trimMargin()
-        )
-        f.setExecutable(true, false)
+        val dir = out.get().asFile
+        dir.deleteRecursively()
+        if (isWindows) {
+            val f = File(dir, "$appName.bat")
+            f.parentFile.mkdirs()
+            val lines = listOf(
+                "@echo off",
+                "rem Runs the seed finder on the Java runtime bundled next to it; no system Java needed.",
+                "rem Extra JVM options can go in JAVA_OPTS, e.g.  set JAVA_OPTS=-Xmx8g",
+                "setlocal",
+                "set \"APP_HOME=%~dp0\"",
+                "\"%APP_HOME%runtime\\bin\\java.exe\" --enable-native-access=ALL-UNNAMED %JAVA_OPTS% " +
+                        "-jar \"%APP_HOME%lib\\$appName.jar\" %*",
+                "set \"RC=%ERRORLEVEL%\"",
+                "if \"%~1\"==\"\" pause",
+                "exit /b %RC%",
+            )
+            f.writeText(lines.joinToString("\r\n", postfix = "\r\n"))   // cmd wants CRLF
+        } else {
+            val f = File(dir, "bin/$appName")
+            f.parentFile.mkdirs()
+            f.writeText(
+                """
+                |#!/bin/sh
+                |# Runs the seed finder on the Java runtime bundled next to it; no system Java needed.
+                |# Extra JVM options can go in JAVA_OPTS, e.g. JAVA_OPTS="-Xmx8g" ./bin/seedfinder
+                |APP_HOME="${'$'}(cd "${'$'}(dirname "${'$'}0")/.." && pwd)"
+                |exec "${'$'}APP_HOME/runtime/bin/java" --enable-native-access=ALL-UNNAMED ${'$'}JAVA_OPTS \
+                |    -jar "${'$'}APP_HOME/lib/$appName.jar" "${'$'}@"
+                |""".trimMargin()
+            )
+            f.setExecutable(true, false)
+        }
     }
 }
 
@@ -127,17 +156,19 @@ val bundle = tasks.register<Sync>("bundle") {
     into(layout.buildDirectory.dir("bundle/$appName"))
     from(jlinkRuntime) { into("runtime") }
     from(tasks.shadowJar) { into("lib") }
-    from(launcherScript) { into("bin") }
+    from(launcherScript)
     filesMatching(listOf("bin/*", "runtime/bin/*")) {
         permissions { unix("rwxr-xr-x") }
     }
 }
 
+val distDir = layout.buildDirectory.dir("distributions")
+
 val bundleTar = tasks.register<Tar>("bundleTar") {
     group = "distribution"
-    description = "Packs the bundle as build/distributions/$appName-<version>-linux-x64.tar.gz."
+    description = "Packs the bundle as a .tar.gz (Linux)."
     archiveFileName.set("$appName-$version-linux-x64.tar.gz")
-    destinationDirectory.set(layout.buildDirectory.dir("distributions"))
+    destinationDirectory.set(distDir)
     compression = Compression.GZIP
     from(bundle) { into(appName) }
     filesMatching(listOf("$appName/bin/*", "$appName/runtime/bin/*")) {
@@ -145,22 +176,27 @@ val bundleTar = tasks.register<Tar>("bundleTar") {
     }
 }
 
+val bundleZip = tasks.register<Zip>("bundleZip") {
+    group = "distribution"
+    description = "Packs the bundle as a .zip (Windows)."
+    archiveFileName.set("$appName-$version-windows-x64.zip")
+    destinationDirectory.set(distDir)
+    from(bundle) { into(appName) }
+}
+
 /**
  * One self-extracting file: packaging/run-header.sh followed by the tarball.
- *
- *   ./gradlew bundleRun      -> build/distributions/seedfinder.run
- *
- * Drag it onto the VM and run `sh seedfinder.run [flags]`. Starting it with `sh` means it
- * works even when the upload strips the executable bit. The build id stamped into the
+ * Run it with `sh seedfinder-<ver>-linux-x64.run [flags]`; starting it with `sh` works
+ * even when a download or upload strips the executable bit. The build id stamped into the
  * header is a hash of the payload, so a new build unpacks fresh and an unchanged one
  * reuses the copy already unpacked.
  */
-tasks.register("bundleRun") {
+val bundleRun = tasks.register("bundleRun") {
     group = "distribution"
-    description = "Builds build/distributions/$appName.run, a single self-extracting file."
+    description = "Builds a single self-extracting .run file (Linux)."
     val tar = bundleTar.flatMap { it.archiveFile }
     val header = layout.projectDirectory.file("packaging/run-header.sh")
-    val out = layout.buildDirectory.file("distributions/$appName.run")
+    val out = distDir.map { it.file("$appName-$version-linux-x64.run") }
     inputs.file(tar)
     inputs.file(header)
     outputs.file(out)
@@ -168,10 +204,24 @@ tasks.register("bundleRun") {
         val payload = tar.get().asFile.readBytes()
         val id = MessageDigest.getInstance("SHA-256").digest(payload)
             .joinToString("") { "%02x".format(it) }.take(12)
-        val head = header.asFile.readText().replace("@BUILD_ID@", id)
+        // Strip any CR so the header still works if the repo was checked out with CRLF.
+        val head = header.asFile.readText().replace("\r", "").replace("@BUILD_ID@", id)
         val f = out.get().asFile
         f.outputStream().use { it.write(head.toByteArray()); it.write(payload) }
         f.setExecutable(true, false)
+    }
+}
+
+/** Everything a release needs for this OS, collected in build/release/. */
+tasks.register<Sync>("release") {
+    group = "distribution"
+    description = "Builds the release files for this OS into build/release/."
+    into(layout.buildDirectory.dir("release"))
+    if (isWindows) {
+        from(bundleZip)
+    } else {
+        from(bundleRun)
+        from(bundleTar)
     }
 }
 
@@ -183,7 +233,7 @@ tasks.register<Exec>("printModuleDeps") {
     val jdk = toolchainHome
     inputs.file(jar)
     doFirst {
-        executable = jdk.get().file("bin/jdeps").asFile.absolutePath
+        executable = jdk.get().file("bin/jdeps$exe").asFile.absolutePath
         args("--print-module-deps", "--ignore-missing-deps", "--multi-release", "25",
             jar.get().asFile.absolutePath)
     }
