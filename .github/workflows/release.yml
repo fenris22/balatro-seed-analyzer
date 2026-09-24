@@ -1,0 +1,74 @@
+# Builds the seed finder for Linux and Windows and attaches the files to a GitHub Release.
+#
+#   Cut a release:   git tag v1.2 && git push origin v1.2
+#   Test build only: Actions tab -> "Release" -> "Run workflow" (files appear as a
+#                    downloadable artifact on the run page; no release is created)
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash   # Git Bash on Windows, so the same commands work on both
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Work out the version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "APP_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "APP_VERSION=dev-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew release -PappVersion="$APP_VERSION" --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seedfinder-${{ runner.os }}
+          path: build/release/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            **Windows:** download the `.zip`, unzip it, and double-click `seedfinder.bat` (or run it from a terminal with flags, e.g. `seedfinder.bat --help`).
+
+            **Linux:** download the `.run` file and run `sh seedfinder-*-linux-x64.run --help`. The `.tar.gz` holds the same thing unpacked (`seedfinder/bin/seedfinder`).
+
+            No Java install is needed; a Java runtime is bundled. You do need a GPU driver with OpenCL (on Windows the normal AMD/Nvidia/Intel driver has it; on Linux, ROCm for AMD or the Nvidia driver). Without a GPU, use `--disable-gpu`.
