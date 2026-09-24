@@ -71,7 +71,7 @@ val exe = if (isWindows) ".exe" else ""
  * NoClassDefFoundError for a java.* or javax.* class, run ./gradlew printModuleDeps and
  * add what it lists here.
  */
-val runtimeModules = listOf("java.base", "java.logging", "jdk.unsupported")
+val runtimeModules = listOf("java.base", "java.logging", "jdk.httpserver", "jdk.unsupported")
 
 /** The same JDK the project compiles with, so jlink matches the bytecode. */
 val toolchainHome = javaToolchains.launcherFor {
