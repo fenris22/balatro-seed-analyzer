@@ -4,10 +4,10 @@
 // conditions, the pools and the Detail mask, so unused branches are compiled out rather
 // than branched over.
 //
-// SCOPE: jokers, editions, tarots, spectrals, vouchers, pack kinds, and Souls (including
-// the legendary joker queue). Planets, standard cards, bosses and tags are NOT generated
-// here -- a search needing those falls back to the CPU path, which produces identical
-// results more slowly. The device never approximates.
+// SCOPE: jokers, editions, tarots, planets, spectrals, vouchers, skip tags, boss blinds,
+// pack kinds, and Souls (including the legendary joker queue). Playing cards (Standard
+// packs) are NOT generated here -- a search needing those falls back to the CPU path, which
+// produces identical results more slowly. The device never approximates.
 //
 // Anything the device cannot decide -- a resample past MAX_RESAMPLE, an unmapped stream --
 // is punted to the host by flagging the seed into the overflow list.
@@ -105,12 +105,19 @@
 #define CODE_SOUL ((5 << 16) | 0)
 #define CODE_BLACK_HOLE ((5 << 16) | 1)
 #define SPECTRAL_BASE (6 << 16)
+#define PLANET_BASE (7 << 16)
+#define VOUCHER_BASE (8 << 16)
+#define TAG_BASE (9 << 16)       // skip tags
+#define BOSS_BASE (10 << 16)     // index into the full boss list
 
 // Source bits, matching analyzer.Src. A condition's mask says where it will accept a card
 // from, which is how "in the SHOP only, not in a pack" is expressed.
 #define SB_SHOP 1
 #define SB_PACK 2
 #define SB_SOUL 4
+#define SB_TAG 8
+#define SB_VOUCHER 16
+#define SB_BOSS 32
 
 __constant double DECAY[5] = { 10.0, 6.0, 3.0, 2.0, 1.0 };
 FORCE_INLINE double decay_at(int d) { return (d < 5) ? DECAY[d] : 0.0; }
@@ -296,6 +303,7 @@ FORCE_INLINE int rnd_index(double v, int bound) { return (int)(v * (double)bound
 #define SS_JOKER1 2      // +1 uncommon (Joker2), +2 rare (Joker3)
 #define SS_EDITION 5
 #define SS_TAROT 6
+#define SS_PLANET 7
 
 __constant int SHOP_CID[(MAX_SEARCH_ANTE + 1) * NUM_SHOP_STREAMS] = SHOP_CID_INIT;
 
@@ -314,10 +322,20 @@ __constant int SHOP_CID[(MAX_SEARCH_ANTE + 1) * NUM_SHOP_STREAMS] = SHOP_CID_INI
 #define ST_TAROTS       16
 #define ST_SPECTRALS    32
 #define ST_VOUCHERS     64   // this stage must track vouchers (Omen Globe, Telescope, Hone)
+#define ST_PLANETS      128
 
 #define FULL_FLAGS ((WANT_JOKERS ? ST_JOKERS : 0) | (WANT_EDITIONS ? ST_EDITIONS : 0) \
                   | (WANT_SOULS ? ST_SOULS : 0) | (WANT_SOUL_JOKERS ? ST_SOUL_JOKERS : 0) \
-                  | (WANT_TAROTS ? ST_TAROTS : 0) | (WANT_SPECTRALS ? ST_SPECTRALS : 0))
+                  | (WANT_TAROTS ? ST_TAROTS : 0) | (WANT_SPECTRALS ? ST_SPECTRALS : 0) \
+                  | (WANT_PLANETS ? ST_PLANETS : 0))
+
+#if WANT_BOSSES
+// Boss pools in the host's order, as indices into the full boss list (the item code), and
+// the first ante each normal boss can appear in. Finisher bosses (every 8th ante) have no gate.
+__constant int NORMAL_BOSS_CODE[NUM_NORMAL_BOSSES] = NORMAL_BOSS_CODE_INIT;
+__constant int NORMAL_BOSS_GATE[NUM_NORMAL_BOSSES] = NORMAL_BOSS_GATE_INIT;
+__constant int FINISHER_BOSS_CODE[NUM_FINISHER_BOSSES] = FINISHER_BOSS_CODE_INIT;
+#endif
 
 #define ALL_MASK ((1u << NUM_CONDS) - 1u)
 
@@ -622,6 +640,9 @@ __kernel void search(
         int generatedFirstPack;
         int abandoned;
         int killed = 0;
+#if WANT_BOSSES
+        uint usedNormal, usedFinisher;   // bosses already seen; the pool refills when empty
+#endif
 
         // Passes 0..NUM_STAGES-1 are prefilter stages; pass NUM_STAGES is the full scan.
         for (int pass = 0; pass <= NUM_STAGES; pass++) {
@@ -656,12 +677,46 @@ __kernel void search(
 #endif
             generatedFirstPack = 0;
             abandoned = 0;
+#if WANT_BOSSES
+            usedNormal = 0u;
+            usedFinisher = 0u;
+#endif
 
             for (int ante = 1; ante <= lastAnte && !abandoned && !g.overflow; ante++) {
 
                 for (int i = anteEnd[ante - 1]; i < anteEnd[ante]; i++) {
                     state[(size_t)i * gsize + gid] = NAN;
                 }
+
+                // ---- boss blind (full pass only). One run-long stream; the choice is among
+                // bosses not yet seen and allowed this early. Mirrors SeedAnalyzer.nextBoss. ----
+#if WANT_BOSSES
+                if (isFull) {
+                    const int fin = (ante % 8) == 0;
+                    const int n = fin ? NUM_FINISHER_BOSSES : NUM_NORMAL_BOSSES;
+                    uint used = fin ? usedFinisher : usedNormal;
+                    int avail = 0;
+                    for (int i = 0; i < n; i++) {
+                        if (!((used >> i) & 1u) && (fin || NORMAL_BOSS_GATE[i] <= ante)) avail++;
+                    }
+                    if (avail == 0) {
+                        used = 0u;
+                        for (int i = 0; i < n; i++) if (fin || NORMAL_BOSS_GATE[i] <= ante) avail++;
+                    }
+                    int k = rnd_index(RND(F_BOSS, 0, 0, 0), avail);
+                    int pick = 0;
+                    for (int i = 0; i < n; i++) {
+                        if (((used >> i) & 1u) || !(fin || NORMAL_BOSS_GATE[i] <= ante)) continue;
+                        if (k == 0) { pick = i; break; }
+                        k--;
+                    }
+                    used |= (1u << pick);
+                    if (fin) usedFinisher = used; else usedNormal = used;
+                    const int code = fin ? FINISHER_BOSS_CODE[pick] : NORMAL_BOSS_CODE[pick];
+                    OFFER(BOSS_BASE | code, 0, ante, 1, SB_BOSS);
+                    if (g.overflow) break;
+                }
+#endif
 
                 // Rates as they stand before this ante's voucher: the ante's first shop deals
                 // its opening cards (the first entryShop slots) before the voucher can be
@@ -689,7 +744,29 @@ __kernel void search(
                         voucherActive |= (1UL << vIdx);
                         if (vIdx & 1) voucherActive |= (1UL << (vIdx - 1));
                     }
+#if OFFER_VOUCHERS
+                    // Offered whether or not it is one the player skips: it still shows up.
+                    if (isFull) OFFER(VOUCHER_BASE | vIdx, 0, ante, 1, SB_VOUCHER);
+#endif
                 }
+
+                // ---- skip tags (full pass only): two per ante on one stream. In ante 1 a
+                // tag that cannot appear yet is rerolled on Tag1_resampleN. ----
+#if WANT_TAGS
+                if (isFull) {
+                    for (int w = 0; w < 2 && !g.overflow; w++) {
+                        int r = 0;
+                        int tIdx = rnd_index(RND(F_TAG, 0, ante, 0), NUM_TAGS);
+                        while (ante < 2 && ((TAG_GATE_MASK >> tIdx) & 1u)) {
+                            r++;
+                            if (r >= MAX_RESAMPLE) { g.overflow = 1; break; }
+                            tIdx = rnd_index(RND(F_TAG, 0, ante, r), NUM_TAGS);
+                        }
+                        if (!g.overflow) OFFER(TAG_BASE | tIdx, 0, ante, w + 1, SB_TAG);
+                    }
+                    if (g.overflow) break;
+                }
+#endif
 
                 const double rate0 = 20.0;
                 const double rate1 = ((voucherActive >> V_TAROT_TYCOON) & 1UL) ? 32.0 : (((voucherActive >> V_TAROT_MERCHANT) & 1UL) ? 9.6 : 4.0);
@@ -779,8 +856,24 @@ __kernel void search(
                         }
 #endif
                     }
-#if WANT_SOULS || WANT_SPECTRALS
+#if WANT_SOULS || WANT_SPECTRALS || WANT_PLANETS
                     else if (family == PACK_CELESTIAL) {
+#if WANT_PLANETS
+                        // Each card rolls for Black Hole first; only if that misses is a
+                        // planet drawn. With Telescope the first card is the planet for your
+                        // most-played hand: forced, it draws nothing and matches nothing.
+                        if (passFlags & ST_PLANETS) {
+                            for (int c = telescope ? 1 : 0; c < size && !g.overflow; c++) {
+                                if (RND(F_SOUL_PLANET, 0, ante, 0) > 0.997) {
+                                    OFFER(CODE_BLACK_HOLE, 0, ante, c + 1, SB_PACK);
+                                } else {
+                                    const int pIdx = rnd_index(RND(F_PLANET, SRC_PL1, ante, 0), POOL_N_PLANETS);
+                                    OFFER(PLANET_BASE | pIdx, 0, ante, c + 1, SB_PACK);
+                                }
+                            }
+                        } else
+#endif
+                        {
 #if WANT_SOULS
                         // Celestial packs can only substitute Black Hole, never a Soul. With
                         // Telescope the first card is a forced planet and rolls nothing.
@@ -792,6 +885,7 @@ __kernel void search(
                             }
                         }
 #endif
+                        }
                     }
                     else if (family == PACK_SPECTRAL) {
                         if (passFlags & (ST_SOULS | ST_SPECTRALS)) {
@@ -811,7 +905,7 @@ __kernel void search(
                 // and not at all in an ante where nothing accepts shop cards (#1). Its
                 // streams live in registers for the length of the loop (#3).
                 if (isFull) {
-                    double sCdt = NAN, sRar = NAN, sJ1 = NAN, sJ2 = NAN, sJ3 = NAN, sEdi = NAN, sTar = NAN;
+                    double sCdt = NAN, sRar = NAN, sJ1 = NAN, sJ2 = NAN, sJ3 = NAN, sEdi = NAN, sTar = NAN, sPla = NAN;
                     __constant const int *scid = SHOP_CID + ante * NUM_SHOP_STREAMS;
 
                     for (int slot = 1; slot <= SHOP_ITEMS; slot++) {
@@ -876,14 +970,20 @@ __kernel void search(
                             OFFER(TAROT_BASE | tIdx, 0, ante, slot, SB_SHOP);
                         }
 #endif
-                        // Remaining shop types draw nothing here. The planet is simply not
-                        // generated, the playing card never had a draw, and the shop
-                        // spectral rate is a hard 0 on this deck.
+#if WANT_PLANETS
+                        else if (type == 2) {
+                            // Shop planets are not soulable either.
+                            const int pIdx = rnd_index(RNDR(scid[SS_PLANET], &sPla), POOL_N_PLANETS);
+                            OFFER(PLANET_BASE | pIdx, 0, ante, slot, SB_SHOP);
+                        }
+#endif
+                        // Remaining shop types draw nothing here: the playing card never had
+                        // a draw, and the shop spectral rate is a hard 0 on this deck.
 
                         if (g.overflow) break;
                     }
                     // Keeps the compiler quiet about streams this search never draws.
-                    (void)sEdi; (void)sTar; (void)sRar; (void)sJ1; (void)sJ2; (void)sJ3;
+                    (void)sEdi; (void)sTar; (void)sRar; (void)sJ1; (void)sJ2; (void)sJ3; (void)sPla;
                 }
 
                 if (g.overflow) break;

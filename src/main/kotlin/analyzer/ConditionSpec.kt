@@ -175,8 +175,8 @@ fun conditionFromJson(raw: Any?, index: Int, forceRequired: Boolean = false): Co
     }
 }
 
-/** Highest ante a condition may reach (endless-mode antes are fine up to here). */
-const val MAX_ANTE = 20
+/** Highest ante a condition may reach. Stream ids hold the ante in 4 bits, so 15 is the ceiling. */
+const val MAX_ANTE = RngKeys.MAX_ANTE
 
 fun conditionsFromJson(raw: Any?, forceRequired: Boolean = false): Array<Condition> {
     val list = asList(raw, "conditions")

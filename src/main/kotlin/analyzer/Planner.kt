@@ -29,7 +29,7 @@ class PrefilterStage(
 ) {
     /**
      * True if this stage's pack contents depend on which vouchers are owned, so the GPU
-     * stage has to generate vouchers too (about one draw per ante). Soul, tarot and
+     * stage has to generate vouchers too (about one draw per ante). Soul, tarot, planet and
      * spectral contents do (Omen Globe, Telescope); so do editions other than Negative
      * (Hone and Glow Up). A Buffoon-only stage looking for Negatives does not.
      */
@@ -100,9 +100,11 @@ object SearchPlanner {
         return Detail(
             jokers = pack && d.jokers,
             tarots = pack && d.tarots,
-            planets = false,
+            // These two used to be forced off, which made a stage for a required pack planet
+            // or playing card unable to ever see one -- it rejected every seed.
+            planets = pack && d.planets,
             spectrals = pack && d.spectrals,
-            standardCards = false,
+            standardCards = pack && d.standardCards,
             editions = d.editions,
             bosses = false,
             tags = false,
@@ -186,8 +188,9 @@ object SearchPlanner {
     fun clampTo(stage: PrefilterStage, global: Detail): Detail {
         val d = stage.detail
         return Detail(
-            d.jokers && global.jokers, d.tarots && global.tarots, false,
-            d.spectrals && global.spectrals, false, d.editions && global.editions, false, false,
+            d.jokers && global.jokers, d.tarots && global.tarots, d.planets && global.planets,
+            d.spectrals && global.spectrals, d.standardCards && global.standardCards,
+            d.editions && global.editions, false, false,
             d.souls && global.souls, d.soulJokers && global.soulJokers,
         )
     }

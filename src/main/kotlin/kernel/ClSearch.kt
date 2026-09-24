@@ -104,6 +104,10 @@ object ClSearch {
     private const val TAROT_TAG = 4
     private const val SPECIAL_TAG = 5
     private const val SPECTRAL_TAG = 6
+    private const val PLANET_TAG = 7
+    private const val VOUCHER_TAG = 8
+    private const val TAGS_TAG = 9      // skip tags
+    private const val BOSS_TAG = 10
 
     /**
      * Item code shared by host and device. Jokers carry their rarity (0-3) in the high
@@ -117,6 +121,10 @@ object ClSearch {
         PoolArr.LEGENDARY_JOKERS.indexOfFirst { it.id == item.id }.let { if (it >= 0) return (R_LEGENDARY shl 16) or it }
         PoolArr.TAROTS.indexOfFirst { it.id == item.id }.let { if (it >= 0) return (TAROT_TAG shl 16) or it }
         PoolArr.SPECTRALS.indexOfFirst { it.id == item.id }.let { if (it >= 0) return (SPECTRAL_TAG shl 16) or it }
+        PoolArr.PLANETS.indexOfFirst { it.id == item.id }.let { if (it >= 0) return (PLANET_TAG shl 16) or it }
+        PoolArr.VOUCHERS.indexOfFirst { it.id == item.id }.let { if (it >= 0) return (VOUCHER_TAG shl 16) or it }
+        PoolArr.TAGS.indexOfFirst { it.id == item.id }.let { if (it >= 0) return (TAGS_TAG shl 16) or it }
+        Pools.BOSSES.indexOfFirst { it.id == item.id }.let { if (it >= 0) return (BOSS_TAG shl 16) or it }
         if (item.id == "The_Soul") return (SPECIAL_TAG shl 16)
         if (item.id == "Black_Hole") return (SPECIAL_TAG shl 16) or 1
         throw Unsupported("${item.displayName} is outside what the kernel generates")
@@ -135,32 +143,19 @@ object ClSearch {
     }
 
     /**
-     * The kernel reproduces the CPU filter pass only for the joker / tarot / spectral /
-     * edition / Soul subset. Anything else stays on the CPU rather than quietly producing
-     * different results.
-     *
-     * Sources matter as much as card types here: the kernel generates vouchers but never
-     * offers them, and generates no tags or bosses at all, so a condition sourced from any
-     * of those must fall back even if the card types it wants are supported.
+     * The kernel reproduces the CPU filter pass for everything except playing cards
+     * (Standard packs). A search that needs those stays on the CPU rather than quietly
+     * producing different results.
      */
-    fun supports(detail: Detail, conditions: Array<Condition>): Boolean {
-        if (detail.planets || detail.standardCards || detail.bosses || detail.tags) return false
-        if (conditions.size > MAX_CONDITIONS) return false
-        if (conditions.any { it.count > MAX_COUNT }) return false
-        val deviceSources = Src.SHOP or Src.PACK or Src.SOUL
-        if (conditions.any { it.sources and deviceSources.inv() != 0 }) return false
-        return true
-    }
+    fun supports(detail: Detail, conditions: Array<Condition>): Boolean =
+        whyUnsupported(detail, conditions) == null
 
     /** Explains a refusal, so a silent fallback never looks like a mystery. */
     fun whyUnsupported(detail: Detail, conditions: Array<Condition>): String? {
-        if (detail.planets) return "planets are not generated on the device"
-        if (detail.standardCards) return "standard cards are not generated on the device"
-        if (detail.bosses) return "bosses are not generated on the device"
-        if (detail.tags) return "tags are not generated on the device"
+        if (detail.standardCards) return "playing cards (Standard packs) are not generated on the device"
         if (conditions.size > MAX_CONDITIONS) return "${conditions.size} conditions exceeds the $MAX_CONDITIONS the packed counts allow"
         conditions.firstOrNull { it.count > MAX_COUNT }?.let { return "count ${it.count} exceeds the $MAX_COUNT the packed counts allow ($it)" }
-        val deviceSources = Src.SHOP or Src.PACK or Src.SOUL
+        val deviceSources = Src.SHOP or Src.PACK or Src.SOUL or Src.TAG or Src.VOUCHER or Src.BOSS
         conditions.firstOrNull { it.sources and deviceSources.inv() != 0 }
             ?.let { return "source ${Src.describe(it.sources)} is not offered on the device ($it)" }
         return null
@@ -169,12 +164,13 @@ object ClSearch {
     // --- reachable stream table ----------------------------------------------
 
     /** Shop stream slots, matching SS_* in search.cl. */
-    private const val SHOP_STREAMS = 7
+    private const val SHOP_STREAMS = 8
     private const val SS_CDT = 0
     private const val SS_RARITY = 1
     private const val SS_JOKER1 = 2   // +1 uncommon, +2 rare
     private const val SS_EDITION = 5
     private const val SS_TAROT = 6
+    private const val SS_PLANET = 7
 
     /** Stage must track vouchers; matches ST_VOUCHERS in search.cl. */
     private const val ST_VOUCHERS = 64
@@ -182,7 +178,8 @@ object ClSearch {
     /** Stage content flags, matching ST_* in search.cl. */
     private fun stageFlags(d: Detail): Int =
         (if (d.jokers) 1 else 0) or (if (d.editions) 2 else 0) or (if (d.souls) 4 else 0) or
-                (if (d.soulJokers) 8 else 0) or (if (d.tarots) 16 else 0) or (if (d.spectrals) 32 else 0)
+                (if (d.soulJokers) 8 else 0) or (if (d.tarots) 16 else 0) or (if (d.spectrals) 32 else 0) or
+                (if (d.planets) 128 else 0)
 
     /**
      * Enumerates every (family, source, ante, resample) the kernel can reach and compacts
@@ -191,6 +188,7 @@ object ClSearch {
      */
     private class Streams(
         maxAnte: Int, wantEditions: Boolean, wantSouls: Boolean, wantTarots: Boolean, wantSpectrals: Boolean,
+        wantPlanets: Boolean, wantTags: Boolean, wantBosses: Boolean,
     ) {
         val ids = ArrayList<Int>()
         val keys = ArrayList<String>()
@@ -279,6 +277,14 @@ object ClSearch {
                     add(RngKeys.SOUL_SPECTRAL, 0, a)
                     if (wantEditions) add(RngKeys.EDITION, RngKeys.SRC_SOU, a)
                 }
+                if (wantPlanets) {
+                    // Celestial pack planets; the Black Hole roll comes before each one.
+                    add(RngKeys.PLANET, RngKeys.SRC_PL1, a)
+                    add(RngKeys.SOUL_PLANET, 0, a)
+                }
+                // Two tags per ante on one stream. Only ante 1 rerolls (tags that cannot
+                // appear before ante 2), so only it needs resample slots.
+                if (wantTags) add(RngKeys.TAG, 0, a, if (a == 1) RngKeys.MAX_RESAMPLE else 1)
                 anteEnd[a] = ids.size
             }
             // Streams with no ante of their own -- the Soul's legendary queue and Omen
@@ -286,6 +292,8 @@ object ClSearch {
             // A Soul rerolls legendaries already handed out, on Joker4_resampleN.
             if (wantSouls) add(RngKeys.JOKER4, 0, 0, RngKeys.MAX_RESAMPLE)
             if (wantSouls || wantTarots || wantSpectrals) add(RngKeys.OMEN_GLOBE, 0, 0)
+            // The boss key has no ante either: one stream for the run.
+            if (wantBosses) add(RngKeys.BOSS, 0, 0)
             stateCount = ids.size
             sealed = true
 
@@ -304,6 +312,7 @@ object ClSearch {
                 shop(SS_JOKER1 + 2, RngKeys.JOKER3, RngKeys.SRC_SHO)
                 if (wantEditions) shop(SS_EDITION, RngKeys.EDITION, RngKeys.SRC_SHO)
                 if (wantTarots) shop(SS_TAROT, RngKeys.TAROT, RngKeys.SRC_SHO)
+                if (wantPlanets) shop(SS_PLANET, RngKeys.PLANET, RngKeys.SRC_SHO)
             }
         }
 
@@ -526,6 +535,32 @@ object ClSearch {
         d("SPECTRAL_RETRY_MASK", "${java.lang.Long.toUnsignedString(retryMask)}UL")
         d("WANT_SOULS", if (detail.souls) 1 else 0)
         d("WANT_SOUL_JOKERS", if (detail.soulJokers) 1 else 0)
+        d("WANT_PLANETS", if (detail.planets) 1 else 0)
+        // The voucher is always drawn (it sets the shop odds); it is only offered to the
+        // conditions when one of them can take a voucher.
+        d("OFFER_VOUCHERS", if (conditions.any { it.sources and Src.VOUCHER != 0 }) 1 else 0)
+        d("POOL_N_PLANETS", PoolArr.PLANETS.size)
+
+        // Skip tags: pool size, and which tags cannot appear before ante 2.
+        d("WANT_TAGS", if (detail.tags) 1 else 0)
+        require(PoolArr.TAGS.size <= 32) { "tag pool no longer fits a 32-bit gate mask" }
+        d("NUM_TAGS", PoolArr.TAGS.size)
+        var tagGate = 0L
+        for (i in PoolArr.TAGS.indices) if (PoolArr.TAG_GATED[i]) tagGate = tagGate or (1L shl i)
+        d("TAG_GATE_MASK", "${tagGate}u")
+
+        // Boss blinds: the normal and finisher pools as indices into Pools.BOSSES (the item
+        // code), in pool order, with the first ante each normal boss may appear in.
+        d("WANT_BOSSES", if (detail.bosses) 1 else 0)
+        val normal = Pools.NORMAL_BOSSES
+        val finisher = Pools.FINISHER_BOSS_ITEMS
+        require(normal.size <= 32 && finisher.size <= 32) { "boss pools no longer fit 32-bit used masks" }
+        d("NUM_NORMAL_BOSSES", normal.size)
+        d("NUM_FINISHER_BOSSES", finisher.size)
+        d("NORMAL_BOSS_CODE_INIT", normal.joinToString(",", "{", "}") { b -> Pools.BOSSES.indexOf(b).toString() })
+        d("NORMAL_BOSS_GATE_INIT", normal.joinToString(",", "{", "}") { b -> (Pools.BOSS_ANTE_GATE[b.id] ?: 1).toString() })
+        d("FINISHER_BOSS_CODE_INIT", finisher.joinToString(",", "{", "}") { b -> Pools.BOSSES.indexOf(b).toString() })
+        require(finisher.none { (Pools.BOSS_ANTE_GATE[it.id] ?: 1) > 1 }) { "finisher bosses are not ante-gated" }
         d("V_TAROT_TYCOON", PoolArr.V_TAROT_TYCOON)
         d("V_TAROT_MERCHANT", PoolArr.V_TAROT_MERCHANT)
         d("V_PLANET_TYCOON", PoolArr.V_PLANET_TYCOON)
@@ -647,7 +682,8 @@ object ClSearch {
         whyUnsupported(detail, conditions)?.let { throw Unsupported(it) }
 
         setExceptionsEnabled(true)
-        val streams = Streams(maxSearchAnte, detail.editions, detail.souls, detail.tarots, detail.spectrals)
+        val streams = Streams(maxSearchAnte, detail.editions, detail.souls, detail.tarots, detail.spectrals,
+            detail.planets, detail.tags, detail.bosses)
         val nStreams = streams.ids.size
 
         val (platform, device) = deviceOverride ?: pickDevice()
