@@ -1,17 +1,9 @@
 package analyzer
 
-import analyzer.Util.editionFromDisplayName
-import analyzer.Util.jokerFromDisplayName
 import analyzer.Util.printReport
-import analyzer.Util.tarotFromDisplayName
-import executor.Task
-import executor.TaskManager
-import kotlinx.coroutines.*
-import kotlin.Boolean
 import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.system.exitProcess
-import kotlin.time.Duration.Companion.milliseconds
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -224,8 +216,20 @@ fun snapshotResults(): List<SeedResult> {
     }
 }
 
+/** Empties the results and reopens the cutoff, ready for a new run. */
+fun resetResults() {
+    resultsLock.lock()
+    try {
+        topResults.clear()
+        cutoff = Double.NEGATIVE_INFINITY
+    } finally {
+        resultsLock.unlock()
+    }
+}
+
 /** Cheap by design: a volatile compare, and a heap insert only when it passes. */
 fun record(seed: String, score: Double) {
+    RunStatus.hits.increment()
     if (score <= cutoff) return
     resultsLock.lock()
     try {
@@ -245,7 +249,7 @@ fun record(seed: String, score: Double) {
  *
  * Runs once, on at most maxResults seeds, so it can afford to be as slow as it likes.
  */
-private fun hydrate(
+internal fun hydrate(
     results: List<SeedResult>,
     conditions: Array<Condition>,
     detail: Detail,
@@ -356,9 +360,6 @@ class Worker(
 // Checkpointing
 // ---------------------------------------------------------------------------
 
-/** Set once the run has printed its own final results, so the shutdown hook stays quiet. */
-private val finished = java.util.concurrent.atomic.AtomicBoolean(false)
-
 /** Guards against two checkpoints writing the file at once. */
 private val checkpointLock = java.util.concurrent.locks.ReentrantLock()
 
@@ -443,52 +444,76 @@ fun checkpoint(
  * thing being searched for, and the window is easier to check here than to infer from an
  * empty result list six hours later.
  */
-private fun describeConditions(conditions: Array<Condition>, maxSearchAnte: Int) {
+fun describeConditions(conditions: Array<Condition>, maxSearchAnte: Int): List<String> {
+    val out = ArrayList<String>()
     val maxPossible = conditions.sumOf { it.maxScore }
-    println("Conditions (searching antes 1..$maxSearchAnte, max score ${"%.0f".format(maxPossible)}):")
+    out.add("Conditions (searching antes 1..$maxSearchAnte, max score ${"%.0f".format(maxPossible)}):")
     for (c in conditions) {
         val share = if (maxPossible > 0) 100.0 * c.maxScore / maxPossible else 0.0
-        println("  $c")
-        println("      up to ${"%.0f".format(c.maxScore)} pts (${"%.0f".format(share)}%), " +
+        out.add("  $c")
+        out.add("      up to ${"%.0f".format(c.maxScore)} pts (${"%.0f".format(share)}%), " +
                 "best at ante ${c.anteTarget} slot ${c.slotTarget}")
     }
     val required = conditions.filter { it.required }
     if (required.isEmpty()) {
-        println("  No required conditions: every seed is scanned to the end of its window.")
-        println("  Marking even one condition as required is the single biggest speedup available.")
+        out.add("  No required conditions: every seed is scanned to the end of its window.")
+        out.add("  Marking even one condition as required is the single biggest speedup available.")
     } else {
         val earliest = required.minOf { it.anteMax }
-        println("  ${required.size} required; earliest kill after ante $earliest.")
+        out.add("  ${required.size} required; earliest kill after ante $earliest.")
     }
+    return out
 }
 
-/** Flags conditions that can never match, which is otherwise a silent zero-result run. */
-private fun warnUnsatisfiable(conditions: Array<Condition>) {
+/**
+ * Flags conditions that can never match, which is otherwise a silent zero-result run.
+ * Returns one message per problem, keyed by the condition's position.
+ */
+fun unsatisfiableReasons(conditions: Array<Condition>): List<Pair<Int, String>> {
     val legendaryIds = Pools.LEGENDARY_JOKERS.map { it.id }.toHashSet()
-    val consumableIds = (Pools.TAROTS + Pools.PLANETS + Pools.SPECTRALS).map { it.id }.toHashSet()
+    val consumableIds = (Pools.TAROTS + Pools.PLANETS + Pools.SPECTRALS).map { it.id }.toHashSet() +
+            setOf("The_Soul", "Black_Hole")
     val jokerIds = (Pools.COMMON_JOKERS + Pools.UNCOMMON_JOKERS + Pools.RARE_JOKERS).map { it.id }.toHashSet()
     val tagIds = Pools.TAGS.map { it.id }.toHashSet()
+    val voucherIds = Pools.VOUCHERS.map { it.id }.toHashSet()
+    val bossIds = Pools.BOSSES.map { it.id }.toHashSet()
 
-    for (c in conditions) {
-        for (id in c.itemIds) {
+    val out = ArrayList<Pair<Int, String>>()
+    for ((i, c) in conditions.withIndex()) {
+        for (item in c.items) {
+            val id = item.id
+            val name = item.displayName
             if (id in legendaryIds && c.sources and Src.SOUL == 0) {
-                println("WARNING: $c can never match -- legendary jokers only come from a Soul; add Src.SOUL.")
+                out.add(i to "$name only comes from a Soul, so it needs the Soul source.")
             }
             if (id in jokerIds && c.sources and Src.SHOP_OR_PACK == 0) {
-                println("WARNING: $c can never match -- that joker only appears in a shop or a Buffoon pack.")
+                out.add(i to "$name only appears in a shop or a Buffoon pack.")
+            }
+            if (id in consumableIds && c.sources and Src.SHOP_OR_PACK == 0) {
+                out.add(i to "$name only appears in a shop or a pack.")
             }
             if (id in tagIds && c.sources and Src.TAG == 0) {
-                println("WARNING: $c can never match -- tags need Src.TAG.")
+                out.add(i to "$name is a tag, so it needs the Tag source.")
+            }
+            if (id in voucherIds && c.sources and Src.VOUCHER == 0) {
+                out.add(i to "$name is a voucher, so it needs the Voucher source.")
+            }
+            if (id in bossIds && c.sources and Src.BOSS == 0) {
+                out.add(i to "$name is a boss blind, so it needs the Boss source.")
             }
             if (id in consumableIds && c.editionTarget != null && c.editionTarget.id != Condition.NO_EDITION.id) {
-                println("WARNING: $c can never match -- consumables are generated without editions.")
+                out.add(i to "$name is a consumable, and consumables never have an edition.")
             }
             if (id in tagIds && c.anteMax < 2 && id in Pools.TAG_ANTE_GATE) {
-                println("WARNING: $c can never match -- that tag cannot appear before ante 2.")
+                out.add(i to "$name cannot appear before ante 2.")
             }
         }
     }
+    return out
 }
+
+fun warnUnsatisfiable(conditions: Array<Condition>): List<String> =
+    unsatisfiableReasons(conditions).map { (i, msg) -> "${conditions[i]} can never match -- $msg" }
 
 // ---------------------------------------------------------------------------
 // Threshold calibration
@@ -531,13 +556,19 @@ fun calibrateCutoff(scores: MutableList<Double>, sampled: Long, planned: Long, t
 // Entry point
 // ---------------------------------------------------------------------------
 
-@OptIn(ExperimentalAtomicApi::class)
-suspend fun main(args: Array<String>) {
-    val start = System.currentTimeMillis()
+/** Vouchers skipped when neither the conditions file nor the web page says otherwise. */
+val DEFAULT_IGNORED_VOUCHERS = listOf("Planet_Merchant", "Magic_Trick", "Tarot_Merchant")
 
+/**
+ * With --conditions FILE the search runs straight away, headless, and exits when done:
+ * that is the mode for a server or a VM. With --examine SEED one seed is printed. Anything
+ * else starts the web page.
+ */
+fun main(args: Array<String>) {
     // -----------------------------------------------------------------------
     // Defaults. Every one of these can be overridden by a flag; run with --help
     // for the list. Edit them here to change what a run with no flags does.
+    // In web mode they are what the settings panel starts with.
     // -----------------------------------------------------------------------
     val defaults = RunOptions(
         maxResults = 200,                 // --max-results
@@ -551,229 +582,40 @@ suspend fun main(args: Array<String>) {
         chunk = 4_000_000,                // --chunk        (seeds per GPU launch)
     )
 
-    val opts = try {
-        Cli.parse(args, defaults) ?: return      // null: --help was shown
+    val file: ConditionFile?
+    val opts: RunOptions
+    try {
+        // The file's own settings sit between the built-in defaults and the flags, so a
+        // flag always wins.
+        file = Cli.conditionsPath(args)?.let { ConditionFile.load(it) }
+        val base = file?.let { applySettings(defaults, it.settings, validate = false) } ?: defaults
+        opts = Cli.parse(args, base) ?: return      // null: --help was shown
     } catch (e: CliError) {
         println("error: ${e.message}")
         println("Run with --help to see every flag.")
-        kotlin.system.exitProcess(2)
+        exitProcess(2)
+    } catch (e: SpecError) {
+        println("error in the conditions file: ${e.message}")
+        exitProcess(2)
     }
 
-    // Vouchers the player skips. Everything else is assumed bought the moment it appears.
-    val ignoredVouchers = listOf("Planet_Merchant", "Magic_Trick", "Tarot_Merchant")
+    val ignoredVouchers = file?.ignoredVouchers ?: DEFAULT_IGNORED_VOUCHERS
 
     opts.examine?.let { examineSeed(it, ignoredVouchers) }
 
-    maxResults = opts.maxResults
-    ClSearch.GLOBAL_SIZE = opts.globalSize
-    ClSearch.LOCAL_SIZE = opts.localSize.toLong()
-    ClSearch.CHUNK = opts.chunk
-    val useGpu = opts.useGpu
-    val startIndex = opts.startIndex
-    val seedsToCount = opts.seedsToCount
-    val checkpointEvery = opts.resolvedCheckpoint
-    val calibrationSeeds = opts.calibrationSeeds
-
-    println("Settings: seeds ${"%,d".format(startIndex)} to ${"%,d".format(opts.endIndex)} " +
-            "(${"%,d".format(seedsToCount)}), max results $maxResults, " +
-            (if (checkpointEvery > 0) "checkpoint every ${"%,d".format(checkpointEvery)}, " else "checkpoints off, ") +
-            "calibration ${"%,d".format(calibrationSeeds)}, " +
-            (if (useGpu) "GPU global ${opts.globalSize}/CU, local ${opts.localSize}, chunk ${"%,d".format(opts.chunk)}"
-            else "CPU only"))
-
-    val shopItems = 100
-
-    // -----------------------------------------------------------------------
-    // Conditions
-    //
-    // `required = true` means the seed is discarded if this is not satisfied by the time
-    // its ante window closes. The anteRange/slotRange/sources are the hard window; the
-    // *Target/*Priority values only decide how well a match inside it scores.
-    // -----------------------------------------------------------------------
-    val conditions = arrayOf(
-
-        Condition(
-            jokerFromDisplayName("Chicot"),
-            required = true,
-            anteRange = 2..5,
-            sources = Src.SOUL,
-            editionPriority = 10,
-            antePriority = 10,
-        ),
-
-        Condition(
-            jokerFromDisplayName("Perkeo"),
-            required = true,
-            anteRange = 1..3,
-            sources = Src.SOUL,
-            antePriority = 3,
-        ),
-
-        Condition(
-            listOf(jokerFromDisplayName("Blueprint"),jokerFromDisplayName("Brainstorm")),
-            required = true,
-            anteRange = 1..2,
-            antePriority = 10,
-            editionTarget = editionFromDisplayName("Negative"),
-            editionPriority = 10,
-            sources = Src.PACK,
-        ),
-        )
-
-    val detail = Detail.forItems(
-        conditions.flatMap { it.items },
-        needEditions = conditions.any { it.editionTarget != null },
-    )
-
-    val maxSearchAnte = conditions.maxOf { it.anteMax }
-
-    describeConditions(conditions, maxSearchAnte)
-    println("Generating: $detail")
-    warnUnsatisfiable(conditions)
-
-    // Orders the cheap pack/Soul-only requirement checks so the most selective per unit of
-    // work runs first. Sampled on the CPU; takes well under a second.
-    val stages = SearchPlanner.plan(conditions, ignoredVouchers, startIndex)
-
-    Stats.nextIndex.store(startIndex)
-    val endIndex = startIndex + seedsToCount
-    val workerCount = Runtime.getRuntime().availableProcessors()
-
-    // -----------------------------------------------------------------------
-    // GPU path
-    // -----------------------------------------------------------------------
-    if (useGpu) ClSearch.whyUnsupported(detail, conditions)?.let {
-        println("GPU not used: $it. Running on the CPU, which produces identical results more slowly.")
+    if (file == null) {
+        WebServer.start(opts, DEFAULT_IGNORED_VOUCHERS)
+        return      // the server's threads keep the program running
     }
 
-    if (useGpu && ClSearch.supports(detail, conditions)) {
-
-        // Ctrl-C, SIGTERM, or the machine going down mid-run. Without this the results
-        // only ever exist in memory and hours of searching evaporate.
-        val lastProgress = java.util.concurrent.atomic.AtomicLong(startIndex)
-        val lastSearched = java.util.concurrent.atomic.AtomicLong(0)
-        Runtime.getRuntime().addShutdownHook(Thread {
-            if (finished.get()) return@Thread
-            println()
-            checkpoint(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                lastSearched.get(), lastProgress.get(), "interrupted")
-        })
-
-        var nextCheckpointAt = checkpointEvery
-        val progress: (Long, Long) -> Unit = { searched, resumeIndex ->
-            lastSearched.set(searched)
-            lastProgress.set(resumeIndex)
-            if (checkpointEvery > 0 && searched >= nextCheckpointAt) {
-                // Step past every boundary already crossed, so a chunk larger than the
-                // interval does not queue up a run of back-to-back checkpoints.
-                while (nextCheckpointAt <= searched) nextCheckpointAt += checkpointEvery
-                checkpoint(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                    searched, resumeIndex, "checkpoint")
-            }
-        }
-
-        try {
-            // --- calibration ---
-            if (calibrationSeeds > 0 && CALIBRATION_ROUNDS > 0) {
-                val sample = ArrayList<Double>()
-                var sampled = 0L
-                for (round in 0 until CALIBRATION_ROUNDS) {
-                    // Spread the rounds across the range so one unusual stretch does not
-                    // set the bar for the whole run.
-                    val from = startIndex + (seedsToCount / CALIBRATION_ROUNDS) * round
-                    ClSearch.run(
-                        conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                        from, calibrationSeeds,
-                        cutoffOf = { Double.NEGATIVE_INFINITY },
-                        tolerateHitOverflow = true,
-                        quiet = true,
-                        stages = stages,
-                    ) { _, score -> sample.add(score) }
-                    sampled += calibrationSeeds
-                }
-                cutoff = calibrateCutoff(sample, sampled, seedsToCount, calibrationTargetHits)
-            }
-
-            // --- the run ---
-            val gpuRun: (onHit: (Long, Double) -> Unit) -> Unit = { onHit ->
-                if (USE_ALL_GPUS) {
-                    ClSearch.runMulti(
-                        conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                        startIndex, seedsToCount, cutoffOf = { cutoff },
-                        stages = stages, onChunk = progress, onHit = onHit)
-                } else {
-                    ClSearch.run(
-                        conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                        startIndex, seedsToCount, cutoffOf = { cutoff },
-                        stages = stages, onChunk = progress, onHit = onHit)
-                }
-            }
-            gpuRun { index, score ->
-                // Deliberately nothing but a heap insert. Anything heavier here runs
-                // between kernel launches, with the whole device waiting on it.
-                record(seedForIndex(index), score)
-            }
-            Stats.seeds.addAndFetch(seedsToCount)
-            hydrate(snapshotResults(), conditions, detail, maxSearchAnte, shopItems, ignoredVouchers)
-            checkpoint(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-                seedsToCount, startIndex + seedsToCount, "final")
-            finished.set(true)
-            printResults(shopItems, start)
-            return
-        } catch (e: ClSearch.Unsupported) {
-            println("GPU unavailable (${e.message}); falling back to the CPU path.")
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // CPU path
-    // -----------------------------------------------------------------------
-    TaskManager.submit(Task {
-        val monitor = launch(Dispatchers.Default) {
-            var lastSeeds = 0L
-            var lastNanos = System.nanoTime()
-            while (isActive) {
-                delay(5000.milliseconds)
-                val now = System.nanoTime()
-                val seeds = Stats.seeds.load()
-                val dt = (now - lastNanos) / 1e9
-                val killed = Stats.killedByRequirement.load()
-                println(
-                    "%,d seeds | %,.0f seeds/s | %,d killed by requirement | cutoff %s"
-                        .format(seeds, (seeds - lastSeeds) / dt, killed, fmtCutoff(cutoff))
-                )
-                lastSeeds = seeds; lastNanos = now
-            }
-        }
-
-        val workers = List(workerCount) {
-            launch(Dispatchers.Default) {
-                val worker = Worker(conditions, maxSearchAnte, detail, ignoredVouchers, shopItems, stages)
-                while (true) {
-                    val from = Stats.nextIndex.fetchAndAdd(SEED_BATCH.toLong())
-                    if (from >= endIndex) break
-                    val to = minOf(from + SEED_BATCH, endIndex)
-                    for (i in from until to) worker.analyze(i)
-                    worker.flushStats()
-                }
-            }
-        }
-
-        workers.joinAll()
-        monitor.cancel()
-    }).join()
-
-    hydrate(snapshotResults(), conditions, detail, maxSearchAnte, shopItems, ignoredVouchers)
-    checkpoint(conditions, detail, maxSearchAnte, shopItems, ignoredVouchers,
-        Stats.seeds.load(), endIndex, "final")
-    finished.set(true)
-    printResults(shopItems, start)
+    runSearch(SearchConfig(file.conditions, ignoredVouchers, opts))
+    exitProcess(0)
 }
 
 fun fmtCutoff(v: Double): String = if (v == Double.NEGATIVE_INFINITY) "open" else "%.0f".format(v)
 
 @OptIn(ExperimentalAtomicApi::class)
-private fun printResults(shopItems: Int, start: Long) {
+internal fun printResults(shopItems: Int, start: Long) {
     val sorted = topResults.sortedByDescending { it.score }
     println("\nTop ${sorted.size} of ${"%,d".format(Stats.seeds.load())} seeds:")
     for (r in sorted.take(10)) {

@@ -22,6 +22,13 @@ data class RunOptions(
     val chunk: Int,
     /** --examine SEED: print that seed's antes and exit instead of searching. */
     val examine: String? = null,
+    /** --conditions FILE: search those conditions headless instead of starting the web page. */
+    val conditionsFile: String? = null,
+    /** Web page address. 127.0.0.1 keeps it private to this computer. */
+    val host: String = "127.0.0.1",
+    val port: Int = 7777,
+    /** False with --no-browser: start the web page but do not open a browser. */
+    val openBrowser: Boolean = true,
 ) {
     val seedsToCount: Long get() = endIndex - startIndex
 
@@ -72,6 +79,12 @@ object Cli {
         Flag("--local-size", "N", "GPU work-group size (default ${d.localSize}; power of 2 from 64 to 256 recommended)"),
         Flag("--chunk", "N", "Seeds per GPU launch (default ${fmt(d.chunk.toLong())}; 2m to 64m recommended)"),
         Flag("--examine", "SEED", "Print antes 1-8 of one seed in full and exit, without searching"),
+        Flag("--conditions", "FILE", "Search the conditions in FILE (saved from the web page) without the " +
+                "web page, then exit. For servers and VMs"),
+        Flag("--port", "N", "Port for the web page (default ${d.port}; the next free one is used if taken)"),
+        Flag("--host", "ADDR", "Address the web page listens on (default ${d.host}, this computer only; " +
+                "0.0.0.0 lets other computers connect, with no password)"),
+        Flag("--no-browser", null, "Start the web page without opening a browser"),
         Flag("--help", null, "Show this list and exit"),
     )
 
@@ -88,6 +101,9 @@ object Cli {
         println("Balatro seed finder")
         println()
         println("Usage: [flags]   (every flag is optional)")
+        println()
+        println("With no --conditions file, the finder starts a web page and opens it in your browser.")
+        println("Set up the conditions there, or save them to a file and run it headless with --conditions.")
         println()
         println("Numbers accept k (thousand), m (million), b (billion) and t (trillion):")
         println("  4m = 4,000,000   1.5b = 1,500,000,000   250k = 250,000")
@@ -133,6 +149,21 @@ object Cli {
     private fun isPow2(v: Long) = v > 0 && (v and (v - 1)) == 0L
 
     /**
+     * The --conditions value, found before the full parse: the file can carry settings of
+     * its own, which become the defaults the other flags override.
+     */
+    fun conditionsPath(args: Array<String>): String? {
+        for ((i, a) in args.withIndex()) {
+            if (a.startsWith("--conditions=")) return a.substringAfter('=')
+            if (a == "--conditions") {
+                if (i + 1 >= args.size || args[i + 1].startsWith("--")) throw CliError("--conditions needs a value")
+                return args[i + 1]
+            }
+        }
+        return null
+    }
+
+    /**
      * Returns the options, or throws [CliError]. Returns null when --help was given, after
      * printing the help, so the caller can exit without searching.
      */
@@ -151,6 +182,10 @@ object Cli {
             if (name == "--disable-gpu") {
                 if (eq >= 0) throw CliError("--disable-gpu takes no value")
                 o = o.copy(useGpu = false); i++; continue
+            }
+            if (name == "--no-browser") {
+                if (eq >= 0) throw CliError("--no-browser takes no value")
+                o = o.copy(openBrowser = false); i++; continue
             }
 
             val value: String = if (eq >= 0) a.substring(eq + 1) else {
@@ -173,6 +208,13 @@ object Cli {
                     }
                     o.copy(examine = seed)
                 }
+                "--conditions" -> o.copy(conditionsFile = value)
+                "--host" -> o.copy(host = value.trim())
+                "--port" -> {
+                    val p = toInt(name, value)
+                    if (p !in 1..65535) throw CliError("--port must be between 1 and 65535")
+                    o.copy(port = p)
+                }
                 else -> throw CliError("unknown flag '$name'")
             }
             i++
@@ -183,6 +225,11 @@ object Cli {
 
     /** Hard errors stop the run; recommendations only print a warning. */
     fun validate(o: RunOptions) {
+        for (n in notes(o)) println("Note: $n")
+    }
+
+    /** Throws for settings that cannot run; returns advice for ones that merely look off. */
+    fun notes(o: RunOptions): List<String> {
         if (o.maxResults < 1) throw CliError("--max-results must be at least 1")
         if (o.maxResults > MAX_RESULTS_LIMIT) {
             throw CliError("--max-results ${o.maxResults} is too high (limit ${"%,d".format(MAX_RESULTS_LIMIT)}): " +
@@ -204,14 +251,16 @@ object Cli {
         }
         if (o.chunk < 1) throw CliError("--chunk must be at least 1")
 
+        val out = ArrayList<String>()
         if (!isPow2(o.globalSize.toLong()) || o.globalSize !in 2048..16384) {
-            println("Note: --global-size ${o.globalSize} is outside the recommended range (a power of 2 from 2048 to 16384).")
+            out.add("--global-size ${o.globalSize} is outside the recommended range (a power of 2 from 2048 to 16384).")
         }
         if (!isPow2(o.localSize.toLong()) || o.localSize !in 64..256) {
-            println("Note: --local-size ${o.localSize} is outside the recommended range (a power of 2 from 64 to 256).")
+            out.add("--local-size ${o.localSize} is outside the recommended range (a power of 2 from 64 to 256).")
         }
         if (o.chunk !in 2_000_000..64_000_000) {
-            println("Note: --chunk ${"%,d".format(o.chunk)} is outside the recommended range (2m to 64m).")
+            out.add("--chunk ${"%,d".format(o.chunk)} is outside the recommended range (2m to 64m).")
         }
+        return out
     }
 }

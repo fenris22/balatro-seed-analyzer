@@ -67,8 +67,10 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            **Windows:** download the `.zip`, unzip it, and double-click `seedfinder.bat` (or run it from a terminal with flags, e.g. `seedfinder.bat --help`).
+            **Windows:** download the `.zip`, unzip it, and double-click `seedfinder.bat`. The seed finder opens in your browser.
 
-            **Linux:** download the `.run` file and run `sh seedfinder-*-linux-x64.run --help`. The `.tar.gz` holds the same thing unpacked (`seedfinder/bin/seedfinder`).
+            **Linux:** download the `.run` file and run `sh seedfinder-*-linux-x64.run`. It opens in your browser too. The `.tar.gz` holds the same thing unpacked (`seedfinder/bin/seedfinder`).
 
-            No Java install is needed; a Java runtime is bundled. You do need a GPU driver with OpenCL (on Windows the normal AMD/Nvidia/Intel driver has it; on Linux, ROCm for AMD or the Nvidia driver). Without a GPU, use `--disable-gpu`.
+            **On a server:** save your conditions from the web page (Save to file), then run `sh seedfinder-*-linux-x64.run --conditions conditions.json` to search without the web page. `--help` lists every option.
+
+            No Java install is needed; a Java runtime is bundled. For GPU searches you need a graphics driver with OpenCL (on Windows the normal AMD, Nvidia or Intel driver has it; on Linux, ROCm for AMD or the Nvidia driver). Without one, the search runs on the CPU.

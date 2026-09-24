@@ -450,6 +450,10 @@ object ClSearch {
         return best
     }
 
+    /** Names of the GPUs a search would use, for the web page. Empty when there are none. */
+    fun deviceNames(): List<String> =
+        listDevices().map { "${deviceInfo(it.second, CL_DEVICE_NAME).trim()} (${readComputeUnits(it.second)} CUs)" }
+
     private fun platformName(p: cl_platform_id): String = platformInfo(p, CL_PLATFORM_NAME)
 
     private fun platformInfo(p: cl_platform_id, param: Int): String {
@@ -832,6 +836,8 @@ object ClSearch {
         val work = dispenser ?: SeedDispenser(startIndex, seedCount)
 
         while (true) {
+            // Checked once per chunk: a volatile read, nothing on the device's path.
+            if (SearchControl.stopRequested) break
             val base = work.take()
             if (base < 0) break
             val chunk = work.sizeOf(base)

@@ -1,0 +1,1248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Balatro Seed Finder</title>
+<style>
+:root {
+  --bg: #f4f2ee;
+  --panel: #ffffff;
+  --panel-2: #f8f7f4;
+  --line: #e2ded6;
+  --line-strong: #cfc9bd;
+  --text: #1f1d1a;
+  --muted: #6b665d;
+  --faint: #948e83;
+  --accent: #d9443a;
+  --accent-ink: #ffffff;
+  --accent-soft: #fbe7e5;
+  --blue: #1d74d6;
+  --blue-soft: #e3effc;
+  --gold: #b7791f;
+  --gold-soft: #fbf0db;
+  --green: #2f8a4c;
+  --green-soft: #e3f3e8;
+  --warn: #9a5b00;
+  --warn-soft: #fdf1dc;
+  --err: #b42318;
+  --err-soft: #fde8e6;
+  --shadow: 0 1px 2px rgba(30, 25, 15, .06), 0 2px 8px rgba(30, 25, 15, .04);
+  --radius: 10px;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono", Consolas, "Liberation Mono", monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a; --panel: #1d2024; --panel-2: #23272c; --line: #30353b; --line-strong: #414850;
+    --text: #ebe8e2; --muted: #a39f97; --faint: #7d7a73;
+    --accent: #ef5a4f; --accent-soft: #3a2220; --blue: #5aa8f5; --blue-soft: #1d2d40;
+    --gold: #e0a64a; --gold-soft: #3a2f1d; --green: #5cc27d; --green-soft: #1d3325;
+    --warn: #e7a845; --warn-soft: #3a2e1a; --err: #f07167; --err-soft: #3d2120;
+    --shadow: 0 1px 2px rgba(0,0,0,.3); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171a; --panel: #1d2024; --panel-2: #23272c; --line: #30353b; --line-strong: #414850;
+  --text: #ebe8e2; --muted: #a39f97; --faint: #7d7a73;
+  --accent: #ef5a4f; --accent-soft: #3a2220; --blue: #5aa8f5; --blue-soft: #1d2d40;
+  --gold: #e0a64a; --gold-soft: #3a2f1d; --green: #5cc27d; --green-soft: #1d3325;
+  --warn: #e7a845; --warn-soft: #3a2e1a; --err: #f07167; --err-soft: #3d2120;
+  --shadow: 0 1px 2px rgba(0,0,0,.3); color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select { font: inherit; color: inherit; }
+h1, h2, h3 { margin: 0; line-height: 1.2; }
+h2 { font-size: 16px; font-weight: 650; }
+h3 { font-size: 13px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); }
+.faint { color: var(--faint); }
+.small { font-size: 12.5px; }
+.hidden { display: none !important; }
+
+header.top {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 10px; margin-right: auto; }
+.logo {
+  width: 28px; height: 28px; border-radius: 7px; background: var(--accent); color: var(--accent-ink);
+  display: grid; place-items: center; font-weight: 800; font-size: 15px; transform: rotate(-6deg);
+}
+.brand h1 { font-size: 17px; font-weight: 700; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--line); font-size: 12.5px; color: var(--muted);
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.dot.ok { background: var(--green); } .dot.warn { background: var(--warn); } .dot.run { background: var(--blue); animation: pulse 1.2s infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line-strong);
+  background: var(--panel); cursor: pointer; font-weight: 550; white-space: nowrap;
+}
+.btn:hover { background: var(--panel-2); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover { filter: brightness(1.06); }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+.btn.ghost:hover { background: var(--panel-2); color: var(--text); }
+.btn.small { padding: 4px 9px; font-size: 12.5px; }
+.btn.icon { padding: 5px 8px; }
+.btn.big { padding: 12px 18px; font-size: 16px; width: 100%; border-radius: 10px; }
+.btn.stop { background: var(--text); border-color: var(--text); color: var(--bg); }
+
+main.layout {
+  display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 20px;
+  max-width: 1380px; margin: 0 auto; padding: 20px;
+}
+@media (max-width: 980px) { main.layout { grid-template-columns: 1fr; padding: 14px; } }
+@media (max-width: 700px) { header.top { position: static; padding: 10px 14px; } }
+.col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+.panel-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 14px 16px 10px; }
+.panel-head .grow { margin-right: auto; }
+.panel-body { padding: 4px 16px 16px; }
+aside.side {
+  position: sticky; top: 66px; align-self: start; display: flex; flex-direction: column; gap: 16px;
+  max-height: calc(100vh - 80px); overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-width: thin; padding-bottom: 4px;
+}
+@media (max-width: 980px) { aside.side { position: static; max-height: none; overflow: visible; } }
+.grid-side { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 12px; }
+.grid-side .inp { width: 100%; }
+
+/* --- conditions --- */
+.cond-list { display: flex; flex-direction: column; gap: 12px; }
+.cond {
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel);
+  border-left: 4px solid var(--line-strong);
+}
+.cond.required { border-left-color: var(--accent); }
+.cond.bad { border-color: var(--err); border-left-color: var(--err); }
+.cond-top { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px; flex-wrap: wrap; }
+.cond-num { font-weight: 700; color: var(--muted); font-size: 13px; min-width: 22px; }
+.cond-sum { flex: 1 1 260px; font-weight: 550; min-width: 0; }
+.cond-body { padding: 2px 12px 12px; display: grid; gap: 10px; }
+.row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+.field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.field > label, .lbl { font-size: 12px; color: var(--muted); font-weight: 550; }
+.inp, select.inp {
+  height: 32px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 7px;
+  background: var(--panel); min-width: 0;
+}
+.inp:focus, select.inp:focus, .btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+.inp.num { width: 64px; }
+.inp.wide { width: 150px; }
+.inp.err { border-color: var(--err); }
+.pair { display: flex; align-items: center; gap: 6px; }
+.pair span { color: var(--faint); }
+
+.toggle { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; font-weight: 550; }
+.toggle input { appearance: none; width: 34px; height: 20px; border-radius: 999px; background: var(--line-strong); position: relative; cursor: pointer; margin: 0; transition: background .15s; }
+.toggle input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+.toggle input:checked { background: var(--accent); }
+.toggle input:checked::after { transform: translateX(14px); }
+
+.srcs { display: flex; gap: 4px; flex-wrap: wrap; }
+.src {
+  padding: 5px 10px; border-radius: 7px; border: 1px solid var(--line-strong); background: var(--panel);
+  cursor: pointer; font-size: 13px; user-select: none;
+}
+.src.on { background: var(--blue-soft); border-color: var(--blue); color: var(--blue); font-weight: 600; }
+
+.items { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.item-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 4px 4px 4px 10px; border-radius: 999px;
+  background: var(--gold-soft); color: var(--text); border: 1px solid transparent; font-weight: 550; font-size: 13px;
+}
+.item-chip button { border: 0; background: transparent; cursor: pointer; color: var(--muted); width: 20px; height: 20px; border-radius: 50%; line-height: 1; }
+.item-chip button:hover { background: rgba(0,0,0,.08); color: var(--text); }
+.picker { position: relative; }
+.picker .inp { width: 220px; }
+.menu {
+  position: absolute; top: 36px; left: 0; z-index: 30; width: 300px; max-height: 340px; overflow: auto;
+  background: var(--panel); border: 1px solid var(--line-strong); border-radius: 9px; box-shadow: 0 8px 28px rgba(0,0,0,.18);
+  padding: 4px;
+}
+.menu .grp { font-size: 11.5px; font-weight: 650; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; padding: 8px 8px 3px; }
+.menu .opt { padding: 6px 8px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+.menu .opt:hover, .menu .opt.hl { background: var(--blue-soft); }
+.menu .opt .faint { font-size: 12px; }
+.menu .empty { padding: 10px; color: var(--muted); }
+
+details.more > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; font-weight: 550; list-style: none; display: inline-flex; gap: 6px; align-items: center; }
+details.more > summary::-webkit-details-marker { display: none; }
+details.more > summary::before { content: "▸"; font-size: 10px; transition: transform .15s; }
+details.more[open] > summary::before { transform: rotate(90deg); }
+details.more > .inner { padding-top: 10px; }
+
+.msg { font-size: 12.5px; padding: 6px 10px; border-radius: 7px; }
+.msg.err { background: var(--err-soft); color: var(--err); }
+.msg.warn { background: var(--warn-soft); color: var(--warn); }
+.msg.info { background: var(--blue-soft); color: var(--blue); }
+.msg.ok { background: var(--green-soft); color: var(--green); }
+.msgs { display: flex; flex-direction: column; gap: 6px; }
+
+.badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.badge.est { background: var(--green-soft); border-color: transparent; color: var(--green); font-weight: 600; }
+
+.estimate-box { margin: 0 16px 12px; padding: 12px 14px; border-radius: 9px; background: var(--panel-2); border: 1px dashed var(--line-strong); }
+.estimate-box .big { font-size: 18px; font-weight: 700; }
+
+/* --- settings --- */
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px 16px; }
+.hint { font-size: 12px; color: var(--faint); }
+.vouchers { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 4px 10px; }
+.vouchers label { display: flex; gap: 6px; align-items: center; font-size: 13px; cursor: pointer; }
+
+/* --- run panel --- */
+.phase { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.bar { height: 10px; background: var(--panel-2); border-radius: 999px; overflow: hidden; border: 1px solid var(--line); }
+.bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--gold)); transition: width .6s ease; }
+.bar.indet > div { width: 30% !important; animation: slide 1.4s infinite ease-in-out; }
+@keyframes slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; }
+.stat .k { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+.stat .v { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.stat .s { font-size: 12px; color: var(--faint); }
+.stat.full { grid-column: 1 / -1; }
+
+/* --- results --- */
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; border-top: 0; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--panel-2); }
+td.seed { font-family: var(--mono); font-weight: 700; font-size: 14px; white-space: nowrap; }
+td.score { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+td.rank { color: var(--faint); width: 36px; }
+.matchlist { font-size: 12.5px; color: var(--muted); }
+.empty-state { padding: 26px 16px; text-align: center; color: var(--muted); }
+
+pre.log {
+  margin: 0; max-height: 320px; overflow: auto; font: 12px/1.5 var(--mono); padding: 10px 12px;
+  background: var(--panel-2); border-radius: 8px; border: 1px solid var(--line); white-space: pre-wrap; word-break: break-word;
+}
+
+/* --- seed dialog --- */
+dialog {
+  border: 1px solid var(--line-strong); border-radius: 12px; padding: 0; width: min(980px, calc(100vw - 32px));
+  max-height: calc(100vh - 40px); background: var(--panel); color: var(--text); box-shadow: 0 20px 60px rgba(0,0,0,.3);
+}
+dialog::backdrop { background: rgba(10, 10, 10, .45); }
+.dlg-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); z-index: 2; flex-wrap: wrap; }
+.dlg-body { padding: 14px 18px 18px; overflow: auto; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; margin: 10px 0 12px; }
+.tab { padding: 5px 11px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel-2); cursor: pointer; font-weight: 600; font-size: 13px; }
+.tab.on { background: var(--text); color: var(--bg); border-color: var(--text); }
+.ante-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 720px) { .ante-grid { grid-template-columns: 1fr; } }
+.kv { display: grid; grid-template-columns: 80px 1fr; gap: 4px 10px; font-size: 13.5px; }
+.kv .k { color: var(--muted); }
+ol.shop { margin: 6px 0 0; padding-left: 26px; font-size: 13.5px; }
+ol.shop li { padding: 1px 0; }
+.hl-item { background: var(--gold-soft); border-radius: 4px; padding: 0 4px; font-weight: 650; }
+.pack { padding: 6px 0; border-top: 1px dashed var(--line); font-size: 13.5px; }
+.pack:first-child { border-top: 0; }
+.pack b { font-weight: 650; }
+
+.toast {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 50;
+  background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 9px; font-weight: 550;
+  box-shadow: 0 8px 24px rgba(0,0,0,.25); opacity: 0; transition: opacity .2s; pointer-events: none;
+}
+.toast.show { opacity: 1; }
+.spin { width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: rot .8s linear infinite; display: inline-block; }
+@keyframes rot { to { transform: rotate(360deg); } }
+.offline { position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,.55); display: grid; place-items: center; }
+.offline .panel { padding: 22px 26px; max-width: 420px; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <div class="logo">S</div>
+    <h1>Balatro Seed Finder</h1>
+  </div>
+  <span class="chip" id="gpuChip" title="The device searches run on"><span class="dot"></span><span>Looking for GPUs…</span></span>
+  <button class="btn ghost small" id="saveFileBtn" title="Save conditions and settings to a file, e.g. to run on a server with --conditions">Save to file</button>
+  <button class="btn ghost small" id="openFileBtn" title="Load conditions and settings from a file">Open file</button>
+  <input type="file" id="fileInput" accept=".json,application/json" class="hidden">
+  <button class="btn ghost small" id="themeBtn" title="Switch light and dark">Theme</button>
+  <button class="btn small" id="quitBtn" title="Stop the program. A search in progress is saved first.">Quit</button>
+</header>
+
+<main class="layout">
+  <div class="col">
+
+    <section class="panel" id="condPanel">
+      <div class="panel-head">
+        <h2 class="grow">Conditions</h2>
+        <button class="btn small" id="estimateBtn" title="Samples random seeds on the CPU for a few seconds">Estimate how common</button>
+        <button class="btn small primary" id="addBtn">+ Add condition</button>
+      </div>
+      <div class="estimate-box hidden" id="estimateBox"></div>
+      <div class="panel-body">
+        <div class="msgs" id="globalMsgs" style="margin-bottom:10px"></div>
+        <div class="cond-list" id="condList"></div>
+      </div>
+    </section>
+
+    <section class="panel" id="resultsPanel">
+      <div class="panel-head">
+        <h2 class="grow">Results <span class="muted small" id="resultsCount"></span></h2>
+        <form id="lookupForm" class="pair" autocomplete="off">
+          <input class="inp mono" id="lookupSeed" placeholder="Look up a seed" style="width:150px; text-transform:uppercase" maxlength="8">
+          <button class="btn small" type="submit">View</button>
+        </form>
+        <button class="btn small" id="downloadResults" title="The same file the program saves next to itself">Download results.txt</button>
+      </div>
+      <div id="resultsBody"><div class="empty-state">No results yet. Set up your conditions and press Start.</div></div>
+    </section>
+
+    <section class="panel">
+      <details class="more" id="logDetails" style="padding:14px 16px">
+        <summary>Program log</summary>
+        <div class="inner"><pre class="log" id="log"></pre></div>
+      </details>
+    </section>
+  </div>
+
+  <aside class="side">
+    <section class="panel">
+      <div class="panel-body" style="padding-top:16px; display:flex; flex-direction:column; gap:14px">
+        <button class="btn big primary" id="startBtn">Start search</button>
+        <div class="phase"><span class="dot" id="phaseDot"></span><span id="phaseText">Ready</span></div>
+        <div>
+          <div class="bar" id="bar"><div></div></div>
+          <div class="row small muted" style="justify-content:space-between; margin-top:6px; gap:6px">
+            <span id="progressText">—</span><span id="percentText"></span>
+          </div>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="k">Speed</div><div class="v" id="stSpeed">—</div><div class="s" id="stSpeedSub"></div></div>
+          <div class="stat"><div class="k">Time left</div><div class="v" id="stEta">—</div><div class="s" id="stElapsed"></div></div>
+          <div class="stat full"><div class="k">Seeds meeting your required conditions</div><div class="v" id="stEst">—</div><div class="s" id="stEstSub">Measured while the search runs</div></div>
+          <div class="stat"><div class="k">Results kept</div><div class="v" id="stHeld">—</div><div class="s" id="stHeldSub"></div></div>
+          <div class="stat"><div class="k">Score cutoff</div><div class="v" id="stCutoff">—</div><div class="s">Seeds must beat this</div></div>
+        </div>
+        <div class="msgs" id="runNotes"></div>
+        <div class="msgs" id="runMsgs"></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-body" style="padding-top:14px">
+        <h3 style="margin-bottom:8px">Checks</h3>
+        <div class="msgs" id="checkMsgs"><div class="msg info">Checking…</div></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2 class="grow">Search settings</h2></div>
+      <div class="panel-body">
+        <div class="grid-side">
+          <div class="field">
+            <label for="sStart">First seed index</label>
+            <input class="inp" id="sStart" data-setting="startIndex" placeholder="0">
+            <span class="hint" id="sStartHint"></span>
+          </div>
+          <div class="field">
+            <label for="sEnd">Stop before index</label>
+            <input class="inp" id="sEnd" data-setting="endIndex" placeholder="312m">
+            <span class="hint" id="sEndHint"></span>
+          </div>
+          <div class="field">
+            <label for="sMax">Best seeds to keep</label>
+            <input class="inp" id="sMax" data-setting="maxResults" placeholder="200">
+            <span class="hint">Only the top scorers are kept</span>
+          </div>
+          <div class="field">
+            <label for="sCheckpoint">Save results every</label>
+            <input class="inp" id="sCheckpoint" data-setting="checkpointEvery" placeholder="a tenth of the range">
+            <span class="hint">Seeds; 0 turns it off</span>
+          </div>
+        </div>
+        <div class="row" style="margin-top:14px">
+          <label class="toggle"><input type="checkbox" id="sGpu"> Use the GPU</label>
+          <span class="hint">Numbers take k, m, b: 312m = 312,000,000</span>
+        </div>
+        <div class="msgs" id="settingsMsgs" style="margin-top:10px"></div>
+
+        <details class="more" style="margin-top:14px">
+          <summary>Vouchers you never buy</summary>
+          <div class="inner">
+            <p class="hint" style="margin:0 0 8px">Every other voucher is assumed bought as soon as it shows up, which changes shop odds, editions, Omen Globe and Telescope.</p>
+            <div class="vouchers" id="voucherGrid"></div>
+          </div>
+        </details>
+
+        <details class="more" style="margin-top:12px">
+          <summary>GPU tuning</summary>
+          <div class="inner grid-side">
+            <div class="field"><label for="sChunk">Seeds per launch</label><input class="inp" id="sChunk" data-setting="chunk"><span class="hint">2m–64m; lower on a GPU that drives your screen</span></div>
+            <div class="field"><label for="sGlobal">Work items per CU</label><input class="inp" id="sGlobal" data-setting="globalSize"><span class="hint">Power of 2, 2048–16384</span></div>
+            <div class="field"><label for="sLocal">Work-group size</label><input class="inp" id="sLocal" data-setting="localSize"><span class="hint">Power of 2, 64–256</span></div>
+            <div class="field"><label for="sCal">Calibration seeds</label><input class="inp" id="sCal" data-setting="calibrationSeeds"><span class="hint">Sampled to set the score cutoff; 0 skips</span></div>
+          </div>
+        </details>
+      </div>
+    </section>
+
+  </aside>
+</main>
+
+<dialog id="seedDialog">
+  <div class="dlg-head">
+    <h2 class="mono" id="dlgSeed" style="font-size:20px"></h2>
+    <span class="muted small" id="dlgIndex"></span>
+    <span id="dlgBadge"></span>
+    <span style="margin-left:auto"></span>
+    <button class="btn small" id="dlgCopy">Copy seed</button>
+    <button class="btn small" id="dlgClose">Close</button>
+  </div>
+  <div class="dlg-body" id="dlgBody"></div>
+</dialog>
+
+<div class="toast" id="toast"></div>
+<div class="offline hidden" id="offline"><div class="panel"><h2 style="margin-bottom:8px">The seed finder is not running</h2><p class="muted" style="margin:0">Start the program again, then reload this page. Your conditions are kept in this browser.</p></div></div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+const STORE_KEY = "seedfinder.page.v1";
+const DEFAULT_CONDITIONS = [
+  { items: ["Chicot"], required: true, anteMin: 2, anteMax: 5, sources: ["SOUL"], editionPriority: 10, antePriority: 10 },
+  { items: ["Perkeo"], required: true, anteMin: 1, anteMax: 3, sources: ["SOUL"], antePriority: 3 },
+  { items: ["Blueprint", "Brainstorm"], required: true, anteMin: 1, anteMax: 2, sources: ["PACK"],
+    edition: "Negative", editionPriority: 10, antePriority: 10 },
+];
+const SOURCE_LABEL = { SHOP: "Shop", PACK: "Pack", SOUL: "Soul", TAG: "Tag", VOUCHER: "Voucher", BOSS: "Boss" };
+const SOURCE_PHRASE = { SHOP: "the shop", PACK: "a pack", SOUL: "a Soul", TAG: "a skip tag", VOUCHER: "the voucher", BOSS: "the boss blind" };
+const SOURCE_TIP = {
+  SHOP: "Cards for sale in the shop. Slot 1 is the first card; rerolls continue the count.",
+  PACK: "Cards inside booster packs. Slot is the card's position in its pack (Buffoon jokers count across the ante's Buffoon packs).",
+  SOUL: "The legendary joker a Soul card gives. Slot 1 means the first Soul of the run.",
+  TAG: "Skip tags. Slot 1 is the small blind's tag, 2 the big blind's.",
+  VOUCHER: "The voucher offered in the ante.",
+  BOSS: "The ante's boss blind.",
+};
+
+let info = null;             // /api/info
+let itemById = {};           // id -> { id, name, group, groupName, sources }
+let conds = [];              // condition objects, JSON form
+let settings = {};           // settings, as typed
+let ignored = [];            // vouchers never bought
+let estimates = null;        // last /api/estimate
+let lastCheck = null;        // last /api/check
+let status = null;           // last /api/status
+let logNext = 0;
+let uid = 1;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  if (attrs) for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (k === "value") e.value = v;
+    else if (k === "checked") e.checked = !!v;
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return e;
+}
+const fmtInt = (n) => Math.round(n).toLocaleString("en-US");
+function fmtShort(n) {
+  if (!isFinite(n)) return "—";
+  const a = Math.abs(n);
+  if (a >= 1e12) return (n / 1e12).toFixed(a >= 1e13 ? 1 : 2).replace(/\.0+$/, "") + "T";
+  if (a >= 1e9) return (n / 1e9).toFixed(a >= 1e10 ? 1 : 2).replace(/\.0+$/, "") + "B";
+  if (a >= 1e6) return (n / 1e6).toFixed(a >= 1e7 ? 1 : 2).replace(/\.0+$/, "") + "M";
+  if (a >= 1e4) return (n / 1e3).toFixed(a >= 1e5 ? 0 : 1).replace(/\.0+$/, "") + "k";
+  return fmtInt(n);
+}
+function fmtDur(sec) {
+  if (!isFinite(sec) || sec < 0) return "—";
+  sec = Math.round(sec);
+  if (sec < 60) return sec + "s";
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return m + "m " + String(s).padStart(2, "0") + "s";
+  const h = Math.floor(m / 60), mm = m % 60;
+  if (h < 48) return h + "h " + String(mm).padStart(2, "0") + "m";
+  const d = Math.floor(h / 24);
+  return d + "d " + (h % 24) + "h";
+}
+/** Same rules as the program's flags: 312m, 1.5b, 250k, 100_000. */
+function parseCount(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim().replace(/[_,]/g, "").toLowerCase();
+  if (s === "") return null;
+  const m = /^(\d+(?:\.\d+)?)([kmbt]?)$/.exec(s);
+  if (!m) return NaN;
+  const mult = { "": 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12 }[m[2]];
+  const v = Number(m[1]) * mult;
+  return Number.isInteger(Math.round(v * 1e6) / 1e6) ? Math.round(v) : NaN;
+}
+/** The n'th seed, as the program numbers them. */
+function seedForIndex(index) {
+  const chars = info ? info.seedChars : "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const base = chars.length;
+  let n = index, len = 1, block = base;
+  while (n >= block) { n -= block; len++; block *= base; }
+  let out = "";
+  for (let i = 0; i < len; i++) { out = chars[n % base] + out; n = Math.floor(n / base); }
+  return out;
+}
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove("show"), 2200);
+}
+async function api(path, body) {
+  const opts = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  let res;
+  try { res = await fetch(path, opts); }
+  catch (e) { $("offline").classList.remove("hidden"); throw e; }
+  $("offline").classList.add("hidden");
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { const err = new Error(data.error || res.statusText); err.data = data; err.status = res.status; throw err; }
+  return data;
+}
+const cap = (t) => t ? t[0].toUpperCase() + t.slice(1) : t;
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+
+/** Rough 95% range for a Poisson count. */
+function poissonRange(k) {
+  if (k === 0) return [0, 3];
+  return [Math.max(0, Math.pow(Math.sqrt(k) - 0.98, 2)), Math.pow(Math.sqrt(k + 1) + 0.98, 2)];
+}
+function oneIn(p) {
+  if (p <= 0) return "—";
+  if (p >= 0.01) return (p * 100).toFixed(p >= 0.1 ? 0 : 1) + "% of seeds";
+  return "1 in " + fmtShort(1 / p);
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+/** Kept between visits. GPU settings are not: they come from how the program was started. */
+const KEPT_SETTINGS = ["startIndex", "endIndex", "maxResults", "checkpointEvery"];
+function save() {
+  try {
+    const kept = {};
+    for (const k of KEPT_SETTINGS) if (settings[k] !== undefined) kept[k] = settings[k];
+    localStorage.setItem(STORE_KEY, JSON.stringify({ conditions: conds.map(strip), settings: kept, ignoredVouchers: ignored }));
+  } catch (e) { /* private window: nothing to keep */ }
+}
+function load() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) { /* ignore */ }
+  return null;
+}
+/** A condition without page-only fields, in the form the program reads. */
+function strip(c) {
+  const o = {};
+  for (const k of ["items", "count", "required", "anteMin", "anteMax", "slotMin", "slotMax", "sources", "edition",
+                   "editionPriority", "anteTarget", "antePriority", "slotTarget", "slotPriority", "label"]) {
+    if (c[k] !== undefined && c[k] !== null && c[k] !== "") o[k] = c[k];
+  }
+  return o;
+}
+function normalize(c) {
+  return Object.assign({
+    items: [], count: 1, required: false, anteMin: 1, anteMax: 8, slotMin: 1, slotMax: null,
+    sources: ["SHOP", "PACK"], edition: null, editionPriority: 1, anteTarget: null, antePriority: 1,
+    slotTarget: null, slotPriority: 1, label: "",
+  }, c, { _id: uid++, _sourcesTouched: true });
+}
+function payload() {
+  const s = {};
+  for (const [k, v] of Object.entries(settings)) if (v !== "" && v != null) s[k] = v;
+  return { conditions: conds.map(strip), settings: s, ignoredVouchers: ignored };
+}
+
+// ---------------------------------------------------------------------------
+// Condition editor
+// ---------------------------------------------------------------------------
+
+function describe(c) {
+  const names = c.items.map((id) => itemById[id] ? itemById[id].name : id);
+  if (!names.length) return "Pick a card";
+  let what = names.length > 3 ? names.slice(0, 3).join(", ") + " or " + (names.length - 3) + " more" : names.join(" or ");
+  if (c.edition === "No_Edition") what = "base-edition " + what;
+  else if (c.edition) what = c.edition + " " + what;
+  if ((c.count || 1) > 1) what = c.count + "× " + what;
+  const where = (c.sources || []).map((s) => SOURCE_PHRASE[s]).join(" or ") || "nowhere";
+  const antes = c.anteMin === c.anteMax ? "ante " + c.anteMin : "antes " + c.anteMin + "–" + c.anteMax;
+  let slots = "";
+  if (c.slotMax) slots = ", slot " + (c.slotMin || 1) + "–" + c.slotMax;
+  else if ((c.slotMin || 1) > 1) slots = ", from slot " + c.slotMin;
+  return (c.required ? "Must have " : "Bonus for ") + what + " from " + where + " in " + antes + slots;
+}
+
+function renderConditions() {
+  const list = $("condList");
+  list.replaceChildren();
+  conds.forEach((c, i) => list.append(renderCondition(c, i)));
+  if (!conds.length) list.append(el("div", { class: "empty-state" }, "No conditions yet. Add one to start."));
+}
+
+function numInput(c, key, opts = {}) {
+  const inp = el("input", {
+    class: "inp num" + (opts.wide ? " wide" : ""), inputmode: "numeric", placeholder: opts.placeholder || "",
+    value: c[key] == null ? "" : c[key], title: opts.title || null, "aria-label": opts.aria || key,
+  });
+  inp.addEventListener("input", () => {
+    const t = inp.value.trim();
+    if (t === "") c[key] = opts.nullable ? null : undefined;
+    else c[key] = /^\d+$/.test(t) ? Number(t) : t;
+    changed(c, false);
+  });
+  return inp;
+}
+
+function renderCondition(c, i) {
+  const est = estimates && estimates.perCondition && estimates.perCondition[i];
+  const card = el("div", { class: "cond" + (c.required ? " required" : ""), "data-id": c._id });
+
+  // --- top row ---
+  const sum = el("div", { class: "cond-sum" }, describe(c));
+  const reqToggle = el("label", { class: "toggle", title: "Required: seeds without this are thrown away as soon as its antes are over. Not required: it only adds score." },
+    el("input", { type: "checkbox", checked: c.required, onchange: (e) => { c.required = e.target.checked; card.classList.toggle("required", c.required); changed(c); } }),
+    "Required");
+  const estBadge = est ? el("span", { class: "badge est", title: "Share of sampled seeds that have this condition on its own (" + fmtInt(est.hits) + " of " + fmtInt(est.sampled) + ")" }, est.hits ? "≈ " + oneIn(est.hits / est.sampled) : "none in " + fmtShort(est.sampled)) : null;
+  const top = el("div", { class: "cond-top" },
+    el("span", { class: "cond-num" }, "#" + (i + 1)), sum, estBadge, reqToggle,
+    el("button", { class: "btn ghost icon small", title: "Move up", onclick: () => move(i, -1), disabled: i === 0 }, "↑"),
+    el("button", { class: "btn ghost icon small", title: "Move down", onclick: () => move(i, 1), disabled: i === conds.length - 1 }, "↓"),
+    el("button", { class: "btn ghost icon small", title: "Duplicate", onclick: () => { conds.splice(i + 1, 0, normalize(strip(c))); estimates = null; renderConditions(); changed(); } }, "⧉"),
+    el("button", { class: "btn ghost icon small", title: "Delete", onclick: () => { conds.splice(i, 1); estimates = null; renderConditions(); changed(); } }, "✕"),
+  );
+
+  // --- items ---
+  const chips = el("div", { class: "items" });
+  function drawChips() {
+    chips.replaceChildren(...c.items.map((id) => el("span", { class: "item-chip" }, itemById[id] ? itemById[id].name : id,
+      el("button", { title: "Remove", "aria-label": "Remove", onclick: () => { c.items = c.items.filter((x) => x !== id); drawChips(); changed(c); } }, "×"))));
+    chips.append(picker(c, (id) => {
+      if (!c.items.includes(id)) c.items.push(id);
+      // First card picked on a new condition: tick the places that kind of card comes from.
+      const it = itemById[id];
+      if (it && c.items.length === 1 && !c._sourcesTouched) { c.sources = it.sources.slice(); drawSources(); }
+      drawChips(); changed(c);
+    }));
+  }
+
+  // --- sources ---
+  const srcBox = el("div", { class: "srcs" });
+  function drawSources() {
+    srcBox.replaceChildren(...info.catalog.sources.map((s) => el("span", {
+      class: "src" + (c.sources.includes(s) ? " on" : ""), title: SOURCE_TIP[s], role: "checkbox", tabindex: "0",
+      "aria-checked": c.sources.includes(s) ? "true" : "false",
+      onclick: () => toggleSrc(s), onkeydown: (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); toggleSrc(s); } },
+    }, SOURCE_LABEL[s])));
+  }
+  function toggleSrc(s) {
+    c._sourcesTouched = true;
+    c.sources = c.sources.includes(s) ? c.sources.filter((x) => x !== s) : c.sources.concat([s]);
+    drawSources(); changed(c);
+  }
+
+  const edSel = el("select", { class: "inp", "aria-label": "Edition", onchange: (e) => { c.edition = e.target.value || null; changed(c); } },
+    el("option", { value: "" }, "Any edition"),
+    ...info.catalog.editions.map((e) => el("option", { value: e.id }, e.id === "No_Edition" ? "No edition (base card)" : e.name)));
+  edSel.value = c.edition || "";
+
+  const body = el("div", { class: "cond-body" },
+    el("div", { class: "field" }, el("span", { class: "lbl" }, "Any of these cards"), chips),
+    el("div", { class: "row" },
+      el("div", { class: "field" }, el("span", { class: "lbl" }, "From"), srcBox),
+      el("div", { class: "field" }, el("span", { class: "lbl" }, "Edition"), edSel),
+    ),
+    el("div", { class: "row" },
+      el("div", { class: "field" }, el("span", { class: "lbl", title: "How many matching cards are needed (they can be different cards from the list)" }, "How many"), numInput(c, "count", { aria: "How many" })),
+      el("div", { class: "field" }, el("span", { class: "lbl" }, "Antes"),
+        el("div", { class: "pair" }, numInput(c, "anteMin", { aria: "First ante" }), el("span", null, "to"), numInput(c, "anteMax", { aria: "Last ante" }))),
+      el("div", { class: "field" }, el("span", { class: "lbl", title: "Shop: position in the ante's shop, rerolls included. Pack: position in the pack. Soul: which Soul of the run. Tag: 1 small blind, 2 big blind." }, "Slots (blank = any)"),
+        el("div", { class: "pair" }, numInput(c, "slotMin", { aria: "First slot", placeholder: "1" }), el("span", null, "to"), numInput(c, "slotMax", { aria: "Last slot", placeholder: "any", nullable: true }))),
+    ),
+    el("details", { class: "more" },
+      el("summary", null, "Scoring and label"),
+      el("div", { class: "inner" },
+        el("p", { class: "hint", style: "margin:0 0 10px" }, "Inside the window above, closer to the best ante and slot scores more. Weights multiply each part (10 points per unit at the best spot, falling off over 5 steps). An edition condition adds its weight × 10."),
+        el("div", { class: "row" },
+          el("div", { class: "field" }, el("span", { class: "lbl" }, "Best ante"), numInput(c, "anteTarget", { placeholder: String(c.anteMin || 1), nullable: true, aria: "Best ante" })),
+          el("div", { class: "field" }, el("span", { class: "lbl" }, "Ante weight"), numInput(c, "antePriority", { aria: "Ante weight" })),
+          el("div", { class: "field" }, el("span", { class: "lbl" }, "Best slot"), numInput(c, "slotTarget", { placeholder: String(c.slotMin || 1), nullable: true, aria: "Best slot" })),
+          el("div", { class: "field" }, el("span", { class: "lbl" }, "Slot weight"), numInput(c, "slotPriority", { aria: "Slot weight" })),
+          el("div", { class: "field" }, el("span", { class: "lbl" }, "Edition weight"), numInput(c, "editionPriority", { aria: "Edition weight" })),
+          el("div", { class: "field" }, el("span", { class: "lbl" }, "Label"),
+            el("input", { class: "inp", style: "width:200px", placeholder: "optional name", value: c.label || "", oninput: (e) => { c.label = e.target.value; changed(c, false); } })),
+        ),
+      ),
+    ),
+    el("div", { class: "msgs", "data-msgs": "" }),
+  );
+  drawChips();
+  drawSources();
+  card.append(top, body);
+  card._sum = sum;
+  return card;
+}
+
+function picker(c, onPick) {
+  const wrap = el("div", { class: "picker" });
+  const inp = el("input", { class: "inp", placeholder: c.items.length ? "+ add another card" : "Search for a card…", "aria-label": "Add a card" });
+  let menu = null, hl = 0, flat = [];
+  function close() { if (menu) { menu.remove(); menu = null; } }
+  function open() {
+    close();
+    const q = inp.value.trim().toLowerCase();
+    menu = el("div", { class: "menu", role: "listbox" });
+    flat = [];
+    let shown = 0;
+    for (const g of info.catalog.groups) {
+      const hits = g.items.filter((it) => !c.items.includes(it.id) && (!q || it.name.toLowerCase().includes(q) || g.name.toLowerCase().includes(q)));
+      if (!hits.length) continue;
+      menu.append(el("div", { class: "grp" }, g.name));
+      for (const it of hits.slice(0, q ? 40 : 8)) {
+        const idx = flat.length;
+        flat.push(it.id);
+        menu.append(el("div", { class: "opt" + (idx === hl ? " hl" : ""), role: "option",
+          onmousedown: (e) => { e.preventDefault(); pick(it.id); } }, it.name));
+        shown++;
+      }
+      if (!q && hits.length > 8) menu.append(el("div", { class: "opt faint", onmousedown: (e) => { e.preventDefault(); inp.value = g.name.split(" ")[0]; hl = 0; open(); } }, "… " + (hits.length - 8) + " more " + g.name.toLowerCase()));
+    }
+    if (!shown) menu.append(el("div", { class: "empty" }, "Nothing matches “" + inp.value + "”"));
+    wrap.append(menu);
+  }
+  function pick(id) { inp.value = ""; hl = 0; close(); onPick(id); }
+  inp.addEventListener("focus", open);
+  inp.addEventListener("input", () => { hl = 0; open(); });
+  inp.addEventListener("blur", () => setTimeout(close, 120));
+  inp.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); hl = Math.min(hl + 1, flat.length - 1); open(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); hl = Math.max(hl - 1, 0); open(); }
+    else if (e.key === "Enter") { e.preventDefault(); if (flat[hl]) pick(flat[hl]); }
+    else if (e.key === "Escape") { close(); inp.blur(); }
+  });
+  wrap.append(inp);
+  return wrap;
+}
+
+function move(i, d) {
+  const j = i + d;
+  if (j < 0 || j >= conds.length) return;
+  [conds[i], conds[j]] = [conds[j], conds[i]];
+  estimates = null;
+  renderConditions(); changed();
+}
+
+/** Something changed: refresh the summary line, save, and re-check. */
+function changed(c, rerender) {
+  if (c) {
+    const card = document.querySelector('.cond[data-id="' + c._id + '"]');
+    if (card && card._sum) card._sum.textContent = describe(c);
+    if (estimates) { estimates = null; $("estimateBox").classList.add("hidden"); card && card.querySelector(".badge.est") && card.querySelector(".badge.est").remove(); }
+  }
+  save();
+  checkSoon();
+}
+
+// ---------------------------------------------------------------------------
+// Checking as you type
+// ---------------------------------------------------------------------------
+
+const checkSoon = debounce(runCheck, 350);
+async function runCheck() {
+  let res;
+  try { res = await api("/api/check", payload()); }
+  catch (e) { return; }
+  lastCheck = res;
+  // per-condition messages
+  document.querySelectorAll(".cond").forEach((card, i) => {
+    const box = card.querySelector("[data-msgs]");
+    box.replaceChildren();
+    const errs = (res.errors || []).filter((x) => x.index === i);
+    const warns = (res.warnings || []).filter((x) => x.index === i);
+    card.classList.toggle("bad", errs.length > 0);
+    for (const x of errs) box.append(el("div", { class: "msg err" }, cap(x.message.replace(/^Condition \d+:?\s*/, ""))));
+    for (const x of warns) box.append(el("div", { class: "msg warn" }, "Can never match: " + x.message));
+  });
+  const g = $("globalMsgs");
+  g.replaceChildren(...(res.errors || []).filter((x) => x.index == null).map((x) => el("div", { class: "msg err" }, x.message)));
+
+  const sm = $("settingsMsgs");
+  sm.replaceChildren();
+  if (res.settingsError) sm.append(el("div", { class: "msg err" }, res.settingsError));
+  for (const n of res.settingsNotes || []) sm.append(el("div", { class: "msg warn" }, n));
+
+  const cm = $("checkMsgs");
+  cm.replaceChildren();
+  if ((res.errors || []).length || res.settingsError) {
+    cm.append(el("div", { class: "msg err" }, "Fix the marked problems to start."));
+  } else {
+    if (res.gpuReason && settings.useGpu !== false) cm.append(el("div", { class: "msg warn" }, "Runs on the CPU only: " + res.gpuReason + ". Same results, much slower."));
+    else if (settings.useGpu === false) cm.append(el("div", { class: "msg info" }, "GPU is off: the search runs on the CPU."));
+    else cm.append(el("div", { class: "msg ok" }, "Runs on the GPU."));
+    if (!res.requiredCount) cm.append(el("div", { class: "msg warn" }, "Nothing is required, so every seed is scanned to the end. Marking one condition required is the biggest speedup there is."));
+    const warnCount = (res.warnings || []).length;
+    if (warnCount) cm.append(el("div", { class: "msg warn" }, warnCount + " condition" + (warnCount > 1 ? "s" : "") + " can never match; see the notes on them."));
+    cm.append(el("div", { class: "msg info" }, "Best possible score " + fmtInt(res.maxScore) + ". Searches " + fmtInt(res.rangeSize) + " seeds."));
+  }
+  updateStartButton();
+}
+
+// ---------------------------------------------------------------------------
+// Estimate
+// ---------------------------------------------------------------------------
+
+async function runEstimate() {
+  const btn = $("estimateBtn");
+  if (lastCheck && ((lastCheck.errors || []).length)) { toast("Fix the marked conditions first"); return; }
+  btn.disabled = true;
+  btn.replaceChildren(el("span", { class: "spin" }), " Sampling…");
+  const box = $("estimateBox");
+  box.classList.remove("hidden");
+  box.replaceChildren(el("div", { class: "muted" }, "Scanning random seeds on the CPU for a few seconds…"));
+  try {
+    estimates = await api("/api/estimate", Object.assign(payload(), { budgetMs: 4000 }));
+    renderConditions();
+    runCheck();
+    renderEstimateBox();
+  } catch (e) {
+    box.replaceChildren(el("div", { class: "msg err" }, e.message));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Estimate how common";
+  }
+}
+
+function renderEstimateBox() {
+  const box = $("estimateBox");
+  const e = estimates;
+  if (!e) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  const n = e.perCondition.length ? e.perCondition[0].sampled : 0;
+  const range = e.rangeSize;
+  const kids = [];
+  if (!e.combined) {
+    kids.push(el("div", null, el("span", { class: "big" }, "No required conditions"), " — every seed counts; they are ranked by score."));
+  } else {
+    const k = e.combined.hits, s = e.combined.sampled;
+    if (k > 0) {
+      const p = k / s, [lo, hi] = poissonRange(k);
+      kids.push(el("div", null, el("span", { class: "big" }, "≈ " + fmtShort(p * range)), " seeds in your range meet every required condition (" + oneIn(p) + ")"));
+      kids.push(el("div", { class: "small muted" }, "Likely between " + fmtShort(lo / s * range) + " and " + fmtShort(hi / s * range) + ". From " + fmtInt(k) + " of " + fmtInt(s) + " sampled seeds."));
+    } else {
+      // Nothing in the sample: fall back to multiplying the required conditions' own rates.
+      let prod = 1, ok = true;
+      conds.forEach((c, i) => { if (c.required) { const r = e.perCondition[i]; if (!r || !r.hits) ok = false; else prod *= r.hits / r.sampled; } });
+      kids.push(el("div", null, el("span", { class: "big" }, "Rarer than " + oneIn(3 / s)), " — none of " + fmtInt(s) + " sampled seeds had all required conditions."));
+      if (ok && prod > 0) {
+        const expect = prod * range;
+        kids.push(el("div", { class: "small muted" }, "If the conditions were independent: about " + oneIn(prod) + ", so " +
+          (expect < 1 ? "probably none" : "roughly " + fmtShort(expect)) + " in your range of " + fmtShort(range) +
+          ". Treat this as a rough guess; the search measures the real number as it runs."));
+      } else {
+        kids.push(el("div", { class: "small muted" }, "A required condition had no hits at all in the sample, so it may be very rare or impossible. The search measures the real number as it runs."));
+      }
+    }
+  }
+  kids.push(el("div", { class: "small faint", style: "margin-top:4px" }, "Each condition's badge shows how common it is on its own. " + fmtInt(n) + " seeds sampled."));
+  box.replaceChildren(...kids);
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+function renderSettings() {
+  document.querySelectorAll("[data-setting]").forEach((inp) => {
+    const k = inp.dataset.setting;
+    inp.value = settings[k] == null ? "" : settings[k];
+    inp.oninput = () => { settings[k] = inp.value.trim(); updateRangeHints(); save(); checkSoon(); };
+  });
+  $("sGpu").checked = settings.useGpu !== false;
+  $("sGpu").onchange = (e) => { settings.useGpu = e.target.checked; save(); checkSoon(); };
+  const grid = $("voucherGrid");
+  grid.replaceChildren(...info.catalog.vouchers.map((v) => el("label", null,
+    el("input", { type: "checkbox", checked: ignored.includes(v.id), onchange: (e) => {
+      ignored = e.target.checked ? ignored.concat([v.id]) : ignored.filter((x) => x !== v.id);
+      save(); checkSoon(); estimates = null; renderEstimateBox();
+    } }), v.name)));
+  updateRangeHints();
+}
+function updateRangeHints() {
+  const a = parseCount(settings.startIndex ?? ""), b = parseCount(settings.endIndex ?? "");
+  const aa = a == null ? info.settings.startIndex : a, bb = b == null ? info.settings.endIndex : b;
+  $("sStartHint").textContent = isNaN(aa) ? "Not a number" : "Seed " + seedForIndex(aa) + " (" + fmtInt(aa) + ")";
+  $("sEndHint").textContent = isNaN(bb) ? "Not a number" :
+    (bb > aa ? fmtInt(bb - aa) + " seeds, last " + seedForIndex(bb - 1) : "Must be above the first index");
+}
+
+// ---------------------------------------------------------------------------
+// Running
+// ---------------------------------------------------------------------------
+
+function updateStartButton() {
+  const b = $("startBtn");
+  const running = status && status.running;
+  if (running) {
+    b.textContent = SearchStopping ? "Stopping…" : "Stop search";
+    b.className = "btn big stop";
+    b.disabled = SearchStopping;
+  } else {
+    b.textContent = "Start search";
+    b.className = "btn big primary";
+    b.disabled = !!(lastCheck && ((lastCheck.errors || []).length || lastCheck.settingsError));
+  }
+}
+let SearchStopping = false;
+
+async function startOrStop() {
+  if (status && status.running) {
+    SearchStopping = true; updateStartButton();
+    await api("/api/stop", {}).catch(() => {});
+    return;
+  }
+  try {
+    const res = await api("/api/start", payload());
+    SearchStopping = false;
+    $("runNotes").replaceChildren(...(res.notes || []).map((n) => el("div", { class: "msg warn" }, n)));
+    lastRenderedRun = -1;
+    poll();
+  } catch (e) {
+    $("runNotes").replaceChildren(el("div", { class: "msg err" }, e.message));
+  }
+}
+
+const PHASES = {
+  idle: "Ready", planning: "Planning the search…", calibrating: "Calibrating the score cutoff…",
+  searching: "Searching", finishing: "Saving results…", done: "Finished", stopped: "Stopped", failed: "Failed",
+};
+
+let lastRenderedRun = -1;
+let lastResultsKey = "";
+
+function renderStatus(s) {
+  status = s;
+  if (!s.running) SearchStopping = false;
+  updateStartButton();
+  const dot = $("phaseDot");
+  dot.className = "dot" + (s.running ? " run" : s.phase === "done" ? " ok" : s.phase === "failed" ? " warn" : "");
+  let phase = PHASES[s.phase] || s.phase;
+  if (s.running && s.device) phase += " on " + s.device;
+  $("phaseText").textContent = phase;
+
+  const frac = s.total > 0 ? Math.min(1, s.searched / s.total) : 0;
+  const bar = $("bar");
+  bar.classList.toggle("indet", s.running && (s.phase === "planning" || s.phase === "calibrating"));
+  bar.firstElementChild.style.width = (frac * 100).toFixed(2) + "%";
+  if (s.runId > 0) {
+    $("progressText").textContent = fmtShort(s.searched) + " of " + fmtShort(s.total) + " seeds";
+    $("percentText").textContent = (frac * 100).toFixed(frac < 0.1 ? 2 : 1) + "%";
+  }
+
+  const speed = s.running ? s.speed : s.averageSpeed;
+  $("stSpeed").textContent = speed > 0 ? fmtShort(speed) + "/s" : "—";
+  $("stSpeedSub").textContent = s.running ? "seeds per second" : (s.runId > 0 ? "average" : "");
+  const left = s.total - s.searched;
+  $("stEta").textContent = s.running && s.phase === "searching" && s.speed > 0 ? fmtDur(left / s.speed) :
+    (s.phase === "done" ? "Done" : "—");
+  $("stElapsed").textContent = s.runId > 0 ? fmtDur(s.elapsedMs / 1000) + " elapsed" : "";
+
+  // matching-seed estimate
+  const est = $("stEst"), estSub = $("stEstSub");
+  if (s.runId === 0) { est.textContent = "—"; estSub.textContent = "Measured while the search runs"; }
+  else if (!s.hasRequired) { est.textContent = "All"; estSub.textContent = "Nothing is required: every seed counts, ranked by score"; }
+  else {
+    let k = s.sampleHits, n = s.sampleSeeds, from = "the searched seeds";
+    if (s.calibrationSeeds > n) { k = s.calibrationHits; n = s.calibrationSeeds; from = "the calibration sample"; }
+    if (n <= 0) { est.textContent = "…"; estSub.textContent = "Waiting for the first block"; }
+    else if (k === 0 && n >= s.total && from === "the searched seeds") {
+      est.textContent = "None";
+      estSub.textContent = "No seed in the whole range meets them all";
+    } else if (k === 0) {
+      est.textContent = "< " + fmtShort(Math.max(1, 3 / n * s.total));
+      estSub.textContent = "None in " + fmtShort(n) + " seeds so far (rarer than 1 in " + fmtShort(n / 3) + ")";
+    } else {
+      const [lo, hi] = poissonRange(k);
+      const exact = n >= s.total && from === "the searched seeds";
+      est.textContent = (exact ? "" : "≈ ") + fmtShort(k / n * s.total);
+      estSub.textContent = exact ? "Exact: " + fmtInt(k) + " in the whole range (" + oneIn(k / n) + ")"
+        : oneIn(k / n) + " · likely " + fmtShort(lo / n * s.total) + "–" + fmtShort(hi / n * s.total) + " in the range · from " + fmtInt(k) + " in " + fmtShort(n) + " (" + from + ")";
+    }
+  }
+  $("stHeld").textContent = s.runId > 0 ? fmtInt(s.resultsHeld) : "—";
+  $("stHeldSub").textContent = s.runId > 0 ? "of the best " + fmtInt(s.maxResults) : "";
+  $("stCutoff").textContent = s.runId === 0 ? "—" : s.cutoff == null ? "Open" : fmtInt(s.cutoff);
+
+  const msgs = [];
+  if (s.gpuNote) msgs.push(el("div", { class: "msg warn" }, s.gpuNote));
+  if (s.phase === "failed") msgs.push(el("div", { class: "msg err" }, "The search failed: " + (s.message || "see the log")));
+  if (s.phase === "stopped") msgs.push(el("div", { class: "msg info" }, "Stopped. To carry on later, set the first seed index to " + fmtInt(s.resumeIndex) + "."));
+  if (s.phase === "done") msgs.push(el("div", { class: "msg ok" }, "Searched all " + fmtInt(s.searched) + " seeds. Results are saved to " + (info ? info.resultsFile : "results.txt") + "."));
+  $("runMsgs").replaceChildren(...msgs);
+
+  renderGpuChip(s.gpus, s.gpuError);
+  renderResults(s);
+  appendLog(s.log, s.logNext);
+}
+
+function renderGpuChip(gpus, err) {
+  const chip = $("gpuChip");
+  const dot = chip.querySelector(".dot"), txt = chip.lastElementChild;
+  if (gpus == null) { dot.className = "dot"; txt.textContent = "Looking for GPUs…"; return; }
+  if (gpus.length) { dot.className = "dot ok"; txt.textContent = gpus.join(", "); chip.title = gpus.join("\n"); }
+  else { dot.className = "dot warn"; txt.textContent = "No GPU: CPU only"; chip.title = err || "No OpenCL GPU with double precision was found"; }
+}
+
+function renderResults(s) {
+  $("resultsCount").textContent = s.resultsHeld ? "· " + fmtInt(s.resultsHeld) + (s.resultsHeld > s.results.length ? " (top " + s.results.length + " shown)" : "") : "";
+  const key = s.runId + "|" + (s.results.length ? "" : s.phase) + "|" + s.results.map((r) => r.seed + r.summary.length).join(",");
+  if (key === lastResultsKey) return;
+  lastResultsKey = key;
+  const body = $("resultsBody");
+  if (!s.results.length) {
+    body.replaceChildren(el("div", { class: "empty-state" },
+      s.running ? "Searching… results appear here as they are found." :
+      s.phase === "stopped" ? "No seeds matched in the part searched before stopping." :
+      s.phase === "failed" ? "The search failed before finding anything; see the message on the right." :
+      s.runId > 0 ? "No seeds matched. Loosen a required condition or search a wider range." :
+      "No results yet. Set up your conditions and press Start."));
+    return;
+  }
+  const rows = s.results.map((r, i) => el("tr", { onclick: () => openSeed(r.seed), title: "Click for the full seed" },
+    el("td", { class: "rank" }, i + 1),
+    el("td", { class: "seed" }, r.seed),
+    el("td", { class: "score" }, fmtInt(r.score)),
+    el("td", null, r.matches.length ? el("div", { class: "matchlist" }, r.matches.join(" · ")) : el("span", { class: "faint small" }, r.summary || "…")),
+  ));
+  body.replaceChildren(el("div", { style: "overflow-x:auto" }, el("table", null,
+    el("thead", null, el("tr", null, el("th", null, "#"), el("th", null, "Seed"), el("th", null, "Score"), el("th", null, "What matched"))),
+    el("tbody", null, rows))));
+}
+
+function appendLog(lines, next) {
+  if (!lines || !lines.length) { if (next != null) logNext = next; return; }
+  const pre = $("log");
+  const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 30;
+  pre.append(document.createTextNode(lines.join("\n") + "\n"));
+  // keep the page light: trim to the last ~2000 lines
+  if (pre.textContent.length > 400000) pre.textContent = pre.textContent.slice(-300000);
+  if (atBottom) pre.scrollTop = pre.scrollHeight;
+  logNext = next;
+}
+
+let pollTimer = null;
+async function poll() {
+  clearTimeout(pollTimer);
+  try {
+    const s = await api("/api/status?log=" + logNext + "&results=100");
+    renderStatus(s);
+    pollTimer = setTimeout(poll, s.running ? 1000 : 2500);
+  } catch (e) {
+    pollTimer = setTimeout(poll, 3000);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Seed viewer
+// ---------------------------------------------------------------------------
+
+let dlgSeed = "";
+async function openSeed(seed) {
+  seed = String(seed).trim().toUpperCase().replace(/0/g, "O");
+  if (!seed) return;
+  dlgSeed = seed;
+  const d = $("seedDialog");
+  $("dlgSeed").textContent = seed;
+  $("dlgIndex").textContent = "";
+  $("dlgBadge").replaceChildren();
+  $("dlgBody").replaceChildren(el("div", { class: "muted" }, el("span", { class: "spin" }), " Generating…"));
+  if (!d.open) d.showModal();
+  let r;
+  const body = { seed, ignoredVouchers: ignored, shopItems: 20 };
+  if (!(lastCheck && (lastCheck.errors || []).length)) body.conditions = conds.map(strip);
+  try { r = await api("/api/seed", body); }
+  catch (e) { $("dlgBody").replaceChildren(el("div", { class: "msg err" }, e.message)); return; }
+  $("dlgIndex").textContent = "index " + fmtInt(r.index);
+  if (r.requirementsMet != null) {
+    $("dlgBadge").replaceChildren(el("span", { class: "badge " + (r.requirementsMet ? "est" : "") },
+      r.unresolvable ? "Cannot be resolved" : r.requirementsMet ? "Meets your requirements · score " + fmtInt(r.score) : "Misses a requirement · score " + fmtInt(r.score)));
+  }
+  const kids = [];
+  if (r.matches && r.matches.length) {
+    kids.push(el("h3", null, "Matches for your conditions"));
+    kids.push(el("ul", { style: "margin:6px 0 14px; padding-left:20px" }, r.matches.map((m) =>
+      el("li", null, el("b", null, (m.edition ? m.edition + " " : "") + m.item), " — ", m.source, ", ante ", m.ante, ", slot ", m.slot,
+        el("span", { class: "faint" }, " (" + fmtInt(m.score) + " pts, " + m.condition + ")")))));
+  } else if (r.matches) {
+    kids.push(el("p", { class: "muted" }, "Nothing here matches your conditions."));
+  }
+  if (r.conditionsError) kids.push(el("div", { class: "msg warn" }, "Conditions not applied: " + r.conditionsError));
+
+  const wanted = new Set();
+  conds.forEach((c) => c.items.forEach((id) => itemById[id] && wanted.add(itemById[id].name)));
+  const mark = (name) => {
+    const base = name.replace(/^(Foil|Holographic|Polychrome|Negative) /, "");
+    return wanted.has(base) ? el("span", { class: "hl-item" }, name) : name;
+  };
+
+  const tabs = el("div", { class: "tabs" });
+  const pane = el("div");
+  function show(i) {
+    tabs.querySelectorAll(".tab").forEach((t, j) => t.classList.toggle("on", i === j));
+    const a = r.antes[i];
+    pane.replaceChildren(el("div", { class: "ante-grid" },
+      el("div", null,
+        el("div", { class: "kv" },
+          el("span", { class: "k" }, "Boss"), el("span", null, mark(a.boss)),
+          el("span", { class: "k" }, "Voucher"), el("span", null, mark(a.voucher)),
+          el("span", { class: "k" }, "Tags"), el("span", null, a.tags.map(mark).flatMap((x, j) => j ? [", ", x] : [x])),
+          el("span", { class: "k" }, "Souls"), el("span", null, a.souls.length ? a.souls.map(mark).flatMap((x, j) => j ? [", ", x] : [x]) : el("span", { class: "faint" }, "none")),
+        ),
+        el("h3", { style: "margin-top:14px" }, "Packs"),
+        el("div", null, a.packs.map((p) => el("div", { class: "pack" }, el("b", null, p.name), ": ",
+          p.contents.map((x) => mark(x)).flatMap((x, j) => j ? [", ", x] : [x])))),
+      ),
+      el("div", null,
+        el("h3", null, "Shop (first " + a.shop.length + ")"),
+        el("ol", { class: "shop" }, a.shop.map((it) => el("li", null, mark((it.edition ? it.edition + " " : "") + it.name)))),
+      ),
+    ));
+  }
+  r.antes.forEach((a, i) => tabs.append(el("button", { class: "tab", onclick: () => show(i) }, "Ante " + a.ante)));
+  kids.push(tabs, pane);
+  $("dlgBody").replaceChildren(...kids);
+  // open on the first ante with a match, else ante 1
+  const firstAnte = r.matches && r.matches.length ? Math.min(...r.matches.map((m) => m.ante)) : 1;
+  show(Math.max(0, Math.min(r.antes.length - 1, firstAnte - 1)));
+}
+
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
+
+function saveFile() {
+  const data = JSON.stringify(payload(), null, 2);
+  const a = el("a", { href: URL.createObjectURL(new Blob([data], { type: "application/json" })), download: "conditions.json" });
+  document.body.append(a); a.click(); a.remove();
+  toast("Saved conditions.json · run it headless with --conditions conditions.json");
+}
+function openFile(file) {
+  const rd = new FileReader();
+  rd.onload = () => {
+    try {
+      let d = JSON.parse(rd.result);
+      if (Array.isArray(d)) d = { conditions: d };
+      if (!Array.isArray(d.conditions)) throw new Error("no \"conditions\" list in the file");
+      conds = d.conditions.map(normalize);
+      if (d.settings) settings = Object.assign({}, info.settings, d.settings);
+      if (Array.isArray(d.ignoredVouchers)) ignored = d.ignoredVouchers.slice();
+      estimates = null;
+      renderConditions(); renderSettings(); renderEstimateBox(); save(); runCheck();
+      toast("Loaded " + file.name);
+    } catch (e) { toast("Could not read that file: " + e.message); }
+  };
+  rd.readAsText(file);
+}
+
+// ---------------------------------------------------------------------------
+// Start-up
+// ---------------------------------------------------------------------------
+
+function applyTheme(t) {
+  if (t) document.documentElement.setAttribute("data-theme", t); else document.documentElement.removeAttribute("data-theme");
+}
+
+async function init() {
+  try { applyTheme(localStorage.getItem("seedfinder.theme")); } catch (e) {}
+  info = await api("/api/info");
+  for (const g of info.catalog.groups) for (const it of g.items) itemById[it.id] = { id: it.id, name: it.name, group: g.key, groupName: g.name, sources: g.sources };
+
+  const stored = load();
+  conds = (stored && Array.isArray(stored.conditions) ? stored.conditions : DEFAULT_CONDITIONS).map(normalize);
+  settings = Object.assign({}, info.settings);
+  if (stored && stored.settings) for (const k of KEPT_SETTINGS) if (stored.settings[k] !== undefined) settings[k] = stored.settings[k];
+  ignored = stored && Array.isArray(stored.ignoredVouchers) ? stored.ignoredVouchers : info.ignoredVouchers.slice();
+
+  renderConditions();
+  renderSettings();
+  renderGpuChip(info.gpus, info.gpuError);
+
+  $("addBtn").onclick = () => {
+    conds.push(normalize({ _sourcesTouched: false }));
+    conds[conds.length - 1]._sourcesTouched = false;
+    renderConditions(); changed();
+    const cards = document.querySelectorAll(".cond");
+    const last = cards[cards.length - 1];
+    last.scrollIntoView({ behavior: "smooth", block: "center" });
+    const inp = last.querySelector(".picker input"); if (inp) inp.focus();
+  };
+  $("estimateBtn").onclick = runEstimate;
+  $("startBtn").onclick = startOrStop;
+  $("saveFileBtn").onclick = saveFile;
+  $("openFileBtn").onclick = () => $("fileInput").click();
+  $("fileInput").onchange = (e) => { if (e.target.files[0]) openFile(e.target.files[0]); e.target.value = ""; };
+  $("themeBtn").onclick = () => {
+    const dark = getComputedStyle(document.documentElement).colorScheme.includes("dark");
+    const t = dark ? "light" : "dark";
+    applyTheme(t);
+    try { localStorage.setItem("seedfinder.theme", t); } catch (e) {}
+  };
+  $("quitBtn").onclick = async () => {
+    const running = status && status.running;
+    if (!confirm(running ? "A search is running. Quit anyway? The results so far are saved to results.txt." : "Quit the seed finder?")) return;
+    await api("/api/quit", {}).catch(() => {});
+    setTimeout(() => { document.body.replaceChildren(el("div", { class: "empty-state", style: "padding:80px" }, "The seed finder has stopped. You can close this tab.")); }, 400);
+  };
+  $("lookupForm").onsubmit = (e) => { e.preventDefault(); openSeed($("lookupSeed").value); };
+  $("dlgClose").onclick = () => $("seedDialog").close();
+  $("dlgCopy").onclick = () => { navigator.clipboard && navigator.clipboard.writeText(dlgSeed).then(() => toast("Copied " + dlgSeed)); };
+  $("seedDialog").addEventListener("click", (e) => { if (e.target === $("seedDialog")) $("seedDialog").close(); });
+  $("downloadResults").onclick = async () => {
+    let r;
+    try { r = await fetch("/api/results.txt"); } catch (e) { toast("The seed finder is not running"); return; }
+    if (!r.ok) { toast("No results saved yet: they are written at checkpoints and when a search ends"); return; }
+    const a = el("a", { href: URL.createObjectURL(await r.blob()), download: "results.txt" });
+    document.body.append(a); a.click(); a.remove();
+  };
+
+  runCheck();
+  poll();
+}
+
+init().catch((e) => {
+  document.body.prepend(el("div", { class: "msg err", style: "margin:20px" }, "Could not load the page: " + e.message));
+});
+</script>
+</body>
+</html>
