@@ -184,6 +184,9 @@ fun runSearch(config: SearchConfig): List<SeedResult> {
     ClSearch.GLOBAL_SIZE = opts.globalSize
     ClSearch.LOCAL_SIZE = opts.localSize.toLong()
     ClSearch.CHUNK = opts.chunk
+    ClSearch.NV_MAX_REGISTERS = opts.nvRegisters
+    ClSearch.PREFIX_CACHE = opts.prefixCache
+    ClSearch.FORCE_INLINE_DEVICE_FUNCS = opts.forceInline
     val useGpu = opts.useGpu
     val startIndex = opts.startIndex
     val seedsToCount = opts.seedsToCount
@@ -197,7 +200,9 @@ fun runSearch(config: SearchConfig): List<SeedResult> {
             "(${"%,d".format(seedsToCount)}), max results $maxResults, " +
             (if (checkpointEvery > 0) "checkpoint every ${"%,d".format(checkpointEvery)}, " else "checkpoints off, ") +
             "calibration ${"%,d".format(calibrationSeeds)}, " +
-            (if (useGpu) "GPU global ${opts.globalSize}/CU, local ${opts.localSize}, chunk ${"%,d".format(opts.chunk)}"
+            (if (useGpu) "GPU global ${opts.globalSize}/CU, local ${opts.localSize}, chunk ${"%,d".format(opts.chunk)}" +
+                    (if (opts.nvRegisters > 0) ", nv registers ${opts.nvRegisters}" else "") +
+                    ", prefix cache ${opts.prefixCache}" + (if (!opts.forceInline) ", no forced inlining" else "")
             else "CPU only"))
     println("Skipping vouchers: ${ignoredVouchers.joinToString(", ").ifEmpty { "none" }}")
 

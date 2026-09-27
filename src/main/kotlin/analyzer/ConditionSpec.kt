@@ -227,6 +227,15 @@ fun applySettings(base: RunOptions, raw: Any?, validate: Boolean = true): RunOpt
     int("globalSize", "--global-size")?.let { o = o.copy(globalSize = it) }
     int("localSize", "--local-size")?.let { o = o.copy(localSize = it) }
     int("chunk", "--chunk")?.let { o = o.copy(chunk = it) }
+    int("nvRegisters", "--nv-registers")?.let {
+        if (it != 0 && it !in 16..255) throw SpecError("--nv-registers must be 0 or between 16 and 255")
+        o = o.copy(nvRegisters = it)
+    }
+    (s["prefixCache"] as? String)?.lowercase()?.takeIf { it.isNotBlank() }?.let {
+        if (it !in setOf("auto", "local", "private")) throw SpecError("prefix cache must be auto, local or private")
+        o = o.copy(prefixCache = it)
+    }
+    (s["forceInline"] as? Boolean)?.let { o = o.copy(forceInline = it) }
     if (validate) {
         try {
             Cli.notes(o)
@@ -247,6 +256,9 @@ fun settingsToJson(o: RunOptions): Map<String, Any?> = mapOf(
     "globalSize" to o.globalSize,
     "localSize" to o.localSize,
     "chunk" to o.chunk,
+    "nvRegisters" to o.nvRegisters,
+    "prefixCache" to o.prefixCache,
+    "forceInline" to o.forceInline,
 )
 
 /**

@@ -29,6 +29,11 @@ data class RunOptions(
     val port: Int = 7777,
     /** False with --no-browser: start the web page but do not open a browser. */
     val openBrowser: Boolean = true,
+    /** Nvidia register cap per thread; 0 leaves it to the compiler. */
+    val nvRegisters: Int = 0,
+    /** auto, local or private. */
+    val prefixCache: String = "auto",
+    val forceInline: Boolean = true,
 ) {
     val seedsToCount: Long get() = endIndex - startIndex
 
@@ -78,6 +83,11 @@ object Cli {
                 "power of 2 from 2048 to 16384 recommended)"),
         Flag("--local-size", "N", "GPU work-group size (default ${d.localSize}; power of 2 from 64 to 256 recommended)"),
         Flag("--chunk", "N", "Seeds per GPU launch (default ${fmt(d.chunk.toLong())}; 2m to 64m recommended)"),
+        Flag("--nv-registers", "N", "Nvidia only: cap registers per thread so more threads fit (default 0 = " +
+                "compiler's choice; try 64, 80, 96, 128)"),
+        Flag("--prefix-cache", "MODE", "Where the seed-prefix cache lives: auto, local (shared memory) or private " +
+                "(default auto: local on Nvidia, private elsewhere)"),
+        Flag("--no-inline", null, "Let the GPU compiler decide what to inline instead of forcing it"),
         Flag("--examine", "SEED", "Print antes 1-8 of one seed in full and exit, without searching"),
         Flag("--conditions", "FILE", "Search the conditions in FILE (saved from the web page) without the " +
                 "web page, then exit. For servers and VMs"),
@@ -187,6 +197,10 @@ object Cli {
                 if (eq >= 0) throw CliError("--no-browser takes no value")
                 o = o.copy(openBrowser = false); i++; continue
             }
+            if (name == "--no-inline") {
+                if (eq >= 0) throw CliError("--no-inline takes no value")
+                o = o.copy(forceInline = false); i++; continue
+            }
 
             val value: String = if (eq >= 0) a.substring(eq + 1) else {
                 if (i + 1 >= args.size || args[i + 1].startsWith("--")) throw CliError("$name needs a value")
@@ -209,6 +223,16 @@ object Cli {
                     o.copy(examine = seed)
                 }
                 "--conditions" -> o.copy(conditionsFile = value)
+                "--nv-registers" -> {
+                    val r = toInt(name, value)
+                    if (r != 0 && r !in 16..255) throw CliError("--nv-registers must be 0 or between 16 and 255")
+                    o.copy(nvRegisters = r)
+                }
+                "--prefix-cache" -> {
+                    val m = value.trim().lowercase()
+                    if (m !in setOf("auto", "local", "private")) throw CliError("--prefix-cache must be auto, local or private")
+                    o.copy(prefixCache = m)
+                }
                 "--host" -> o.copy(host = value.trim())
                 "--port" -> {
                     val p = toInt(name, value)

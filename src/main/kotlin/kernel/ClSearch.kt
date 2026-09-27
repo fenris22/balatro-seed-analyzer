@@ -86,7 +86,7 @@ object ClSearch {
      * the right value is empirical -- sweep 64, 72, 96, 128 and watch seeds/s. AMD is left
      * alone: CDNA occupancy is already good here and the flag is Nvidia-only anyway.
      */
-    const val NV_MAX_REGISTERS = 0
+    var NV_MAX_REGISTERS = 0
 
     /**
      * Force every device function inline.
@@ -95,7 +95,13 @@ object ClSearch {
      * extra live values push registers up and cost occupancy. Which one wins is a property
      * of the device and the compiler, so it is a switch rather than a decision.
      */
-    const val FORCE_INLINE_DEVICE_FUNCS = true
+    var FORCE_INLINE_DEVICE_FUNCS = true
+
+    /**
+     * Where the seed-prefix cache lives: "auto" (shared memory on Nvidia, private elsewhere),
+     * "local" (shared memory) or "private". Set from --prefix-cache.
+     */
+    var PREFIX_CACHE = "auto"
 
     class Unsupported(msg: String) : Exception(msg)
 
@@ -383,6 +389,37 @@ object ClSearch {
      * which is why a kernel that behaves on a 64-CU consumer part can cap out VRAM and
      * crawl on a 304-CU accelerator.
      */
+    /**
+     * Registers per thread and spills, from the -cl-nv-verbose build log, plus how many
+     * warps that lets each SM hold. This kernel is latency-bound -- long chains of dependent
+     * FP64 divisions -- so resident warps per SM is what sets its speed on Nvidia.
+     */
+    private fun printNvidiaRegisters(program: cl_program, device: cl_device_id) {
+        try {
+            val size = LongArray(1)
+            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, null, size)
+            if (size[0] <= 1) return
+            val log = ByteArray(size[0].toInt())
+            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log.size.toLong(), Pointer.to(log), null)
+            val text = String(log).trimEnd('\u0000')
+            val lines = text.lines().filter {
+                it.contains("registers", ignoreCase = true) || it.contains("spill", ignoreCase = true) ||
+                        it.contains("stack frame", ignoreCase = true)
+            }
+            lines.forEach { println("  ptxas: ${it.trim()}") }
+            val regs = Regex("""Used (\d+) registers""").find(text)?.groupValues?.get(1)?.toIntOrNull()
+            if (regs != null && regs > 0) {
+                // 64K registers per SM, allocated per warp in blocks of 256 (Volta through Blackwell).
+                val perWarp = ((regs * 32 + 255) / 256) * 256
+                val warps = minOf(64, 65536 / perWarp)
+                println("  => $regs registers per thread: at most $warps of 64 warps per SM " +
+                        "(${100 * warps / 64}% occupancy by registers)")
+            }
+        } catch (e: Exception) {
+            // The log is only informational.
+        }
+    }
+
     private fun printKernelInfo(kernel: cl_kernel, device: cl_device_id) {
         val priv = LongArray(1)
         clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_PRIVATE_MEM_SIZE,
@@ -802,7 +839,12 @@ object ClSearch {
         // Nvidia demotes the dynamically indexed prefix cache to per-thread local memory
         // whatever the inlining, so it goes to shared memory there. AMD keeps it private.
         val vendor = deviceInfo(device, CL_DEVICE_VENDOR).lowercase()
-        val useLocalPrefix = vendor.contains("nvidia")
+        val isNvidia = vendor.contains("nvidia")
+        val useLocalPrefix = when (PREFIX_CACHE) {
+            "local" -> true
+            "private" -> false
+            else -> isNvidia
+        }
         val ldsBytes = LOCAL_SIZE * (streams.lenSlotCount or 1) * 8
         if (!quiet) {
             println("Prefix cache: ${if (useLocalPrefix) "__local (${ldsBytes / 1024} KB/group)" else "private"} " +
@@ -814,7 +856,10 @@ object ClSearch {
                 "\n" + loadSource()
         val buildOptions = buildString {
             append(BUILD_OPTIONS)
-            if (useLocalPrefix && NV_MAX_REGISTERS > 0) append(" -cl-nv-maxrregcount=$NV_MAX_REGISTERS")
+            if (isNvidia && NV_MAX_REGISTERS > 0) append(" -cl-nv-maxrregcount=$NV_MAX_REGISTERS")
+            // Makes Nvidia's compiler report registers and spills in the build log, which is
+            // the number that decides how many threads fit on each SM.
+            if (isNvidia && !quiet) append(" -cl-nv-verbose")
         }
         if (!quiet) println("Build options: $buildOptions")
 
@@ -831,6 +876,7 @@ object ClSearch {
         }
         val kernel = clCreateKernel(program, "search", null)
         if (!quiet) printKernelInfo(kernel, device)
+        if (!quiet && isNvidia) printNvidiaRegisters(program, device)
 
         // CPU mirror, used to verify every hit and to redo anything the device punted.
         val cpuState = MatchState(conditions)
