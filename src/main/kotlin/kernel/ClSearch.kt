@@ -139,16 +139,18 @@ object ClSearch {
     var STATE_RESET = "auto"
 
     /**
-     * "on" runs the prefilter stages on a whole grab first and the full scan only on the
-     * survivors, a group at a time; "off" runs each seed through every pass in turn. Only
-     * matters when the search has prefilter stages. "auto" is off until benchmarks say
-     * otherwise. Set from --two-round.
+     * "on" runs the first prefilter stage on a whole grab first, and the other stages and
+     * the full scan only on its survivors, a group at a time; "off" runs each seed through
+     * every pass in turn. Only matters when the search has prefilter stages. "auto" is on:
+     * on the 9070 XT it was never slower, and 1.7-2.8x faster when the first stage passes
+     * around 1% of seeds. Set from --two-round.
      */
     var TWO_ROUND = "auto"
 
     /**
-     * "on" deals all of an ante's Buffoon pack cards in one loop in the prefilter stages,
-     * after rolling the ante's pack kinds, instead of inside each pack. Same draws on every
+     * "on" makes the prefilter stages roll an ante's pack kinds first, then deal its cards
+     * one family at a time in one loop over all its packs (Buffoon; Celestial; Arcana and
+     * Spectral together, in pack order), instead of pack by pack. Same draws on every
      * stream, far less divergence. "auto" is on. Set from --split-packs.
      */
     var SPLIT_PACKS = "auto"
@@ -692,7 +694,7 @@ object ClSearch {
         fun d(name: String, value: Any) = appendLine("#define $name $value")
         d("STATE_TAGS", if (kernelOpts.stateTags) 1 else 0)
         d("COMPACT", if (kernelOpts.twoRound) 1 else 0)
-        d("SPLIT_BUFFOON", if (kernelOpts.splitPacks) 1 else 0)
+        d("SPLIT_PACKS", if (kernelOpts.splitPacks) 1 else 0)
         d("GRAB_SIZE", maxOf(512L, localSize))
         d("RNG_TABLE_BITS", kernelOpts.rngBits)
         d("NUM_CONDS", conditions.size)
@@ -998,7 +1000,7 @@ object ClSearch {
                 "clear" -> false
                 else -> streams.tagsFit
             },
-            twoRound = TWO_ROUND == "on" && stages.isNotEmpty(),
+            twoRound = TWO_ROUND != "off" && stages.isNotEmpty(),
             rngBits = if (RNG_TABLE_BITS < 0) 0 else RNG_TABLE_BITS,
             splitPacks = SPLIT_PACKS != "off",
         )

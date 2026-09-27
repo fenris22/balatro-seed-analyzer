@@ -100,10 +100,10 @@ object Cli {
                 "(default auto: local only if it fits without shrinking the work-group size)"),
         Flag("--state-reset", "MODE", "How the GPU marks random streams unused for each seed: auto, tags " +
                 "(a bit per stream in registers) or clear (write every slot in memory; the old way). Default auto: tags when they fit"),
-        Flag("--two-round", "MODE", "auto, on or off: run the quick prefilter checks on a batch of seeds first, " +
-                "then the full scan only on the survivors, together (default auto: off; benchmark it)"),
+        Flag("--two-round", "MODE", "auto, on or off: run the first quick prefilter check on a batch of seeds " +
+                "first, then the other checks and the full scan only on the survivors, together (default auto: on)"),
         Flag("--split-packs", "MODE", "auto, on or off: in the prefilter checks, roll an ante's pack kinds " +
-                "first and deal all its Buffoon cards in one loop, so GPU lanes stay in step (default auto: on)"),
+                "first and deal its cards one pack family at a time, so GPU lanes stay in step (default auto: on)"),
         Flag("--rng-table", "BITS", "auto, off, 4, 8 or 16: replace the random generator's 44 dependent steps " +
                 "with table lookups (4: 8 KB in shared memory, 8: 64 KB, 16: 8 MB). Default auto: off; benchmark it"),
         Flag("--no-inline", null, "Let the GPU compiler decide what to inline instead of forcing it"),
@@ -162,7 +162,7 @@ object Cli {
             else -> 1L
         }
         val value = BigDecimal(num).multiply(BigDecimal.valueOf(mult))
-        val whole = try { value.toBigIntegerExact() } catch (e: ArithmeticException) {
+        val whole = try { value.toBigIntegerExact() } catch (_: ArithmeticException) {
             throw CliError("$flag: '$raw' is not a whole number of seeds")
         }
         if (whole > BigInteger.valueOf(Long.MAX_VALUE)) throw CliError("$flag: '$raw' is too large")
@@ -314,7 +314,7 @@ object Cli {
         if (o.startIndex >= o.endIndex) {
             throw CliError("--start-index ${"%,d".format(o.startIndex)} must be below --end-index ${"%,d".format(o.endIndex)}")
         }
-        if (o.localSize < 0 || o.localSize > LOCAL_SIZE_LIMIT) {
+        if (o.localSize !in 0 .. LOCAL_SIZE_LIMIT) {
             throw CliError("--local-size must be auto or between 1 and $LOCAL_SIZE_LIMIT")
         }
         if (o.globalSize < 1) throw CliError("--global-size must be at least 1")

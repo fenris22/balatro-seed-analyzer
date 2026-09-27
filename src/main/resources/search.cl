@@ -673,8 +673,8 @@ FORCE_INLINE double best_per_match_from(__constant const int *anteMin, __constan
     } while (0)
 #endif
 
-#ifndef SPLIT_BUFFOON
-#define SPLIT_BUFFOON 0
+#ifndef SPLIT_PACKS
+#define SPLIT_PACKS 0
 #endif
 #if NUM_PACK_KINDS > 16
 #error "pack kinds are packed 4 bits each"
@@ -761,11 +761,14 @@ __kernel void search(
 #endif
 
 #if COMPACT
-    // Two rounds instead of one loop per lane. Round 1 runs only the prefilter stages on
-    // every seed of the grab and queues the survivors; round 2 runs the full scan on the
-    // queue, a whole group's worth at a time, so the lanes of a warp all do the expensive
-    // part together instead of most of them idling while a few go deep. Fewer than a
-    // group's worth left over wait for the next grab; the last grab drains everything.
+    // Two rounds instead of one loop per lane. Round 1 runs only the first prefilter stage
+    // on every seed of the grab and queues the survivors; round 2 runs the remaining stages
+    // and the full scan on the queue, a whole group's worth at a time, so the lanes of a
+    // warp all do the expensive part together instead of most of them idling while a few
+    // go deep. Queuing after the first stage rather than after all of them matters when a
+    // later stage is long (a Soul check after a pack check): run in round 1, its few
+    // survivors held their whole warp. Fewer than a group's worth left over wait for the
+    // next grab; the last grab drains everything.
     __local uint lQueue[WG_SIZE + GRAB_SIZE];
     __local uint lQn;
     if (lid == 0) lQn = 0u;
@@ -799,8 +802,8 @@ __kernel void search(
         }
     for (uint w = lid; w < phaseN; w += lsz) {
         const uint seedOff = (phase == 0) ? grabbed + w : lQueue[w];
-        const int passLo = (phase == 0) ? 0 : NUM_STAGES;
-        const int passHi = (phase == 0) ? NUM_STAGES - 1 : NUM_STAGES;
+        const int passLo = (phase == 0) ? 0 : 1;
+        const int passHi = (phase == 0) ? 0 : NUM_STAGES;
 #else
         if (grabbed >= (uint)chunkSize) break;
         const uint grabEnd = min(grabbed + grabPerGroup, (uint)chunkSize);
@@ -981,14 +984,19 @@ __kernel void search(
                 const int numPacks = (ante == 1) ? 4 : 6;
                 int jokerSlot = 0;
 
-                // Split Buffoon cards (stages only). A stage decides only from counts at the
-                // end of an ante, and Buffoon cards draw from streams nothing else reads, so
-                // the ante's pack kinds can be rolled first and all of its Buffoon cards dealt
-                // in one loop -- each stream still sees its draws in the same order. Inline,
-                // a wave runs the whole card loop at every pack slot where any one lane has a
-                // Buffoon pack (~9% of packs), for the largest pack among them, with the other
-                // lanes masked off; in one loop it runs each lane's own total.
-                const int split = SPLIT_BUFFOON && !isFull;
+                // Split pack cards (stages only). A stage decides only from counts at the end
+                // of an ante, so the ante's pack kinds can be rolled first and its cards dealt
+                // one family at a time, each family in one loop over all its packs. Inline, a
+                // wave runs a family's card loop at every pack slot where any one lane has that
+                // family, for the largest such pack, with the other lanes masked off; in one
+                // loop each lane runs through its own total.
+                //
+                // Every stream still sees its draws in the same order. Buffoon and Celestial
+                // cards draw from streams nothing else reads. Arcana and Spectral cards share
+                // one (Omen Globe's Spectral slots use the Spectral pack's Soul roll), and their
+                // Souls take legendaries from one queue in pack order, so those two families
+                // share one loop in pack order.
+                const int split = SPLIT_PACKS && !isFull;
                 uint preKinds = 0u;
                 if (split) {
                     int bufCards = 0;
@@ -1014,13 +1022,119 @@ __kernel void search(
                         }
                     }
 #endif
+
+#if WANT_SOULS || WANT_PLANETS
+                    // Celestial cards, all packs in one loop. Without planets wanted, only a
+                    // Black Hole could count, so the rolls are skipped unless some condition
+                    // of this pass takes one (nothing else reads their stream).
+                    {
+                        int wantCel = 0, planets = 0;
+#if WANT_PLANETS
+                        if (passFlags & ST_PLANETS) { wantCel = 1; planets = 1; }
+#endif
+#if WANT_SOULS
+                        if (!wantCel && (passFlags & ST_SOULS)) {
+                            for (int i = 0; i < NUM_CONDS && !wantCel; i++) {
+                                if (!((passMask >> i) & 1u)) continue;
+                                const int o = condItemOfs[i], n = condItemCnt[i];
+                                for (int k = 0; k < n; k++) {
+                                    if (condItems[o + k] == CODE_BLACK_HOLE) { wantCel = 1; break; }
+                                }
+                            }
+                        }
+#endif
+                        if (wantCel) {
+                            // With Telescope each pack's first card is forced and rolls nothing.
+                            const int first = telescope ? 1 : 0;
+                            int total = 0;
+                            for (int p = 0; p < numPacks; p++) {
+                                const int kd = (int)((preKinds >> (4 * p)) & 0xFu);
+                                if (packFamily[kd] == PACK_CELESTIAL) total += max(packSize[kd] - first, 0);
+                            }
+                            int p = -1, c = 0, sz = 0;
+                            for (int k = 0; k < total && !g.overflow; k++) {
+                                while (c >= sz) {   // on to the next Celestial pack
+                                    p++;
+                                    const int kd = (int)((preKinds >> (4 * p)) & 0xFu);
+                                    sz = (packFamily[kd] == PACK_CELESTIAL) ? packSize[kd] : 0;
+                                    c = first;
+                                }
+                                const int slot = c + 1;
+                                c++;
+                                if (RND(F_SOUL_PLANET, 0, ante, 0) > 0.997) {
+                                    OFFER(CODE_BLACK_HOLE, 0, ante, slot, SB_PACK);
+                                }
+#if WANT_PLANETS
+                                else if (planets) {
+                                    const int pIdx = rnd_index(RND(F_PLANET, SRC_PL1, ante, 0), POOL_N_PLANETS);
+                                    OFFER(PLANET_BASE | pIdx, 0, ante, slot, SB_PACK);
+                                }
+#endif
+                            }
+                        }
+                    }
+#endif
+
+#if WANT_TAROTS || WANT_SOULS || WANT_SPECTRALS
+                    // Arcana and Spectral cards, in one loop in pack order (see above). An
+                    // Arcana card draws nothing a spectrals-only pass needs unless Omen Globe
+                    // can turn it into a Spectral slot.
+                    {
+                        const int arc = (passFlags & (ST_TAROTS | ST_SOULS)) || ((passFlags & ST_SPECTRALS) && omenGlobe);
+                        const int spe = (passFlags & (ST_SOULS | ST_SPECTRALS)) != 0;
+                        int total = 0;
+                        for (int p = 0; p < numPacks; p++) {
+                            const int kd = (int)((preKinds >> (4 * p)) & 0xFu);
+                            const int fm = packFamily[kd];
+                            if ((fm == PACK_ARCANA && arc) || (fm == PACK_SPECTRAL && spe)) total += packSize[kd];
+                        }
+                        int p = -1, c = 0, sz = 0, fam = 0;
+                        for (int k = 0; k < total && !g.overflow; k++) {
+                            while (c >= sz) {   // on to the next pack of either family
+                                p++;
+                                const int kd = (int)((preKinds >> (4 * p)) & 0xFu);
+                                fam = packFamily[kd];
+                                sz = ((fam == PACK_ARCANA && arc) || (fam == PACK_SPECTRAL && spe)) ? packSize[kd] : 0;
+                                c = 0;
+                            }
+                            const int slot = c + 1;
+                            c++;
+                            if (fam == PACK_SPECTRAL) {
+                                SPECTRAL_SLOT(ante, SRC_SPE, slot);
+                                continue;
+                            }
+                            // An Arcana card, exactly as in the pack loop below.
+                            if (omenGlobe && RND(F_OMEN_GLOBE, 0, 0, 0) > 0.8) {
+                                SPECTRAL_SLOT(ante, SRC_AR2, slot);
+                                continue;
+                            }
+#if WANT_TAROTS
+                            if (passFlags & ST_TAROTS) {
+                                if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
+                                    OFFER(CODE_SOUL, 0, ante, slot, SB_PACK);
+                                    SOUL_FOUND(ante);
+                                } else {
+                                    const int tIdx = rnd_index(RND(F_TAROT, SRC_AR1, ante, 0), POOL_N_TAROTS);
+                                    OFFER(TAROT_BASE | tIdx, 0, ante, slot, SB_PACK);
+                                }
+                                continue;
+                            }
+#endif
+                            if (passFlags & ST_SOULS) {
+                                if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
+                                    OFFER(CODE_SOUL, 0, ante, slot, SB_PACK);
+                                    SOUL_FOUND(ante);
+                                }
+                            }
+                        }
+                    }
+#endif
                 }
 
-                for (int p = 0; p < numPacks && !g.overflow; p++) {
+                // The ordinary pack loop: the full scan, or any pass with split packs off.
+                for (int p = 0; p < numPacks && !g.overflow && !split; p++) {
                     int kind;
-                    if (split) {
-                        kind = (int)((preKinds >> (4 * p)) & 0xFu);
-                    } else if (ante <= 2 && !generatedFirstPack) {
+                    if (ante <= 2 && !generatedFirstPack) {
                         generatedFirstPack = 1;
                         kind = BUFFOON_PACK_INDEX;
                     } else {
@@ -1037,7 +1151,7 @@ __kernel void search(
                     if (family == PACK_BUFFOON) {
 #if WANT_JOKERS
                         // No duplicate prevention (the player may hold Showman).
-                        if ((passFlags & ST_JOKERS) && !split) {
+                        if (passFlags & ST_JOKERS) {
                         for (int c = 0; c < size && !g.overflow; c++) {
                             BUFFOON_CARD(ante);
                         }
