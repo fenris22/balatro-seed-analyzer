@@ -243,6 +243,22 @@ fun applySettings(base: RunOptions, raw: Any?, validate: Boolean = true): RunOpt
         o = o.copy(prefixCache = it)
     }
     (s["forceInline"] as? Boolean)?.let { o = o.copy(forceInline = it) }
+    try {
+        (s["stateReset"] as? String)?.takeIf { it.isNotBlank() }?.let {
+            o = o.copy(stateReset = Cli.parseChoice("stream reset", it, "auto", "tags", "clear"))
+        }
+        (s["twoRound"] as? String)?.takeIf { it.isNotBlank() }?.let {
+            o = o.copy(twoRound = Cli.parseChoice("two-round scan", it, "auto", "on", "off"))
+        }
+        (s["splitPacks"] as? String)?.takeIf { it.isNotBlank() }?.let {
+            o = o.copy(splitPacks = Cli.parseChoice("split pack cards", it, "auto", "on", "off"))
+        }
+        s["rngTable"]?.let { v ->
+            o = o.copy(rngTable = Cli.parseRngTable(if (v is Number) v.toLong().toString() else v.toString()))
+        }
+    } catch (e: CliError) {
+        throw SpecError(e.message ?: "invalid settings")
+    }
     if (validate) {
         try {
             Cli.notes(o)
@@ -267,6 +283,10 @@ fun settingsToJson(o: RunOptions): Map<String, Any?> = mapOf(
     "eagerPrefix" to o.eagerPrefix,
     "prefixCache" to o.prefixCache,
     "forceInline" to o.forceInline,
+    "stateReset" to o.stateReset,
+    "twoRound" to o.twoRound,
+    "splitPacks" to o.splitPacks,
+    "rngTable" to when { o.rngTable < 0 -> "auto"; o.rngTable == 0 -> "off"; else -> o.rngTable.toString() },
 )
 
 /**

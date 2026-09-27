@@ -196,6 +196,10 @@ fun runSearch(config: SearchConfig): List<SeedResult> {
     ClSearch.EAGER_PREFIX = opts.eagerPrefix
     ClSearch.PREFIX_CACHE = opts.prefixCache
     ClSearch.FORCE_INLINE_DEVICE_FUNCS = opts.forceInline
+    ClSearch.STATE_RESET = opts.stateReset
+    ClSearch.TWO_ROUND = opts.twoRound
+    ClSearch.SPLIT_PACKS = opts.splitPacks
+    ClSearch.RNG_TABLE_BITS = opts.rngTable
     val useGpu = opts.useGpu
     val startIndex = opts.startIndex
     val seedsToCount = opts.seedsToCount
@@ -213,7 +217,10 @@ fun runSearch(config: SearchConfig): List<SeedResult> {
                     (if (opts.chunk <= 0) "auto" else "%,d".format(opts.chunk)) +
                     (if (opts.nvRegisters >= 0) ", nv registers ${if (opts.nvRegisters == 0) "compiler's choice" else opts.nvRegisters}" else "") +
                     (if (opts.eagerPrefix) ", eager prefix" else "") +
-                    ", prefix cache ${opts.prefixCache}" + (if (!opts.forceInline) ", no forced inlining" else "")
+                    ", prefix cache ${opts.prefixCache}" + (if (!opts.forceInline) ", no forced inlining" else "") +
+                    ", stream reset ${opts.stateReset}, two-round ${opts.twoRound}, rng table " +
+                    when { opts.rngTable < 0 -> "auto"; opts.rngTable == 0 -> "off"; else -> "${opts.rngTable}-bit" } +
+                    ", split packs ${opts.splitPacks}"
             else "CPU only"))
     println("Skipping vouchers: ${ignoredVouchers.joinToString(", ").ifEmpty { "none" }}")
 

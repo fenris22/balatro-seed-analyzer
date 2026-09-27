@@ -170,6 +170,50 @@ FORCE_INLINE double lua_draw(double d0) {
     return as_double(bits) - 1.0;
 }
 
+// Leap-ahead version of lua_draw (RNG_TABLE_BITS 4, 8 or 16; see RngTable.kt).
+//
+// The 11 steps of each generator are a fixed linear map over its bits, so the host stores
+// what every RNG_TABLE_BITS-bit chunk of the starting value contributes to the result, and
+// the draw becomes 4 * 64 / RNG_TABLE_BITS independent reads XORed together instead of a
+// chain of 44 dependent steps. Same bits out, checked on the host before every run. The
+// 4-bit table (8 KB) is copied into shared memory; the larger ones are read from global.
+#if RNG_TABLE_BITS
+#define RT_CHUNKS (64 / RNG_TABLE_BITS)
+#define RT_SIZE (1 << RNG_TABLE_BITS)
+#define RT_ENTRIES (4 * RT_CHUNKS * RT_SIZE)
+#if RNG_TABLE_BITS == 4
+#define RT_SPACE __local
+#else
+#define RT_SPACE __global
+#endif
+FORCE_INLINE double lua_draw_table(RT_SPACE const ulong *T, double d0) {
+    double d = d0;
+    ulong u;
+    d = d * PI_D; d = d + E_D; u = as_ulong(d);
+    const ulong z0 = (u < 2UL) ? u + 2UL : u;
+    d = d * PI_D; d = d + E_D; u = as_ulong(d);
+    const ulong z1 = (u < 64UL) ? u + 64UL : u;
+    d = d * PI_D; d = d + E_D; u = as_ulong(d);
+    const ulong z2 = (u < 512UL) ? u + 512UL : u;
+    d = d * PI_D; d = d + E_D; u = as_ulong(d);
+    const ulong z3 = (u < 131072UL) ? u + 131072UL : u;
+
+    ulong r = 0;
+    for (int j = 0; j < RT_CHUNKS; j++) {
+        const int sh = j * RNG_TABLE_BITS;
+        r ^= T[(0 * RT_CHUNKS + j) * RT_SIZE + (uint)((z0 >> sh) & (ulong)(RT_SIZE - 1))];
+        r ^= T[(1 * RT_CHUNKS + j) * RT_SIZE + (uint)((z1 >> sh) & (ulong)(RT_SIZE - 1))];
+        r ^= T[(2 * RT_CHUNKS + j) * RT_SIZE + (uint)((z2 >> sh) & (ulong)(RT_SIZE - 1))];
+        r ^= T[(3 * RT_CHUNKS + j) * RT_SIZE + (uint)((z3 >> sh) & (ulong)(RT_SIZE - 1))];
+    }
+    ulong bits = (r & 0x000FFFFFFFFFFFFFUL) | 0x3FF0000000000000UL;
+    return as_double(bits) - 1.0;
+}
+#define LUA_DRAW(g_, d_) lua_draw_table((g_)->rtab, (d_))
+#else
+#define LUA_DRAW(g_, d_) lua_draw(d_)
+#endif
+
 // --- seed handling -----------------------------------------------------------
 
 // From Main.kt's SEED_CHARS via the host defines, so host and device always agree.
@@ -205,6 +249,18 @@ typedef struct {
     double hashedSeed;
     uint havePrefix;             // bitmask over the prefix slots
     int overflow;                // set when the device cannot answer; host redoes the seed
+#if RNG_TABLE_BITS
+    RT_SPACE const ulong *rtab;  // leap-ahead table for LUA_DRAW
+#endif
+#if STATE_TAGS
+    // Which memory streams this pass has touched, as bits instead of NaN in the buffer:
+    // tagAnte covers the current ante's slice [anteBase, anteBase + anteLen), tagRun the
+    // streams with no ante of their own, from runBase. A stream whose bit is clear is
+    // initialised without reading the buffer, and starting an ante or a pass is a register
+    // clear instead of a store per stream. The host checks both regions fit 64 bits.
+    ulong tagAnte, tagRun;
+    int anteBase, anteLen, runBase;
+#endif
 } Rng;
 
 FORCE_INLINE uint seed_char(const Rng *g, int i) {
@@ -297,11 +353,30 @@ FORCE_INLINE double rnd(Rng *g,
     if (cid < 0) { g->overflow = 1; return 0.0; }
 
     const size_t addr = (size_t)cid * g->gsize + g->gid;
+#if STATE_TAGS
+    ulong bit;
+    int inAnte;
+    const int ra = cid - g->anteBase;
+    if ((uint)ra < (uint)g->anteLen) { bit = 1UL << ra; inAnte = 1; }
+    else {
+        const int rr = cid - g->runBase;
+        if ((uint)rr >= 64u) { g->overflow = 1; return 0.0; }   // another ante's stream: never expected
+        bit = 1UL << rr; inAnte = 0;
+    }
+    double st;
+    if ((inAnte ? g->tagAnte : g->tagRun) & bit) {
+        st = g->state[addr];
+    } else {
+        st = init_stream(g, prefix, keyChars, keyLens, keySlots, cid);
+        if (inAnte) g->tagAnte |= bit; else g->tagRun |= bit;
+    }
+#else
     double st = g->state[addr];
     if (isnan(st)) st = init_stream(g, prefix, keyChars, keyLens, keySlots, cid);
+#endif
     const double advanced = round13(frac_d(st * 1.72431234 + 2.134453429141));
     g->state[addr] = advanced;
-    return lua_draw((advanced + g->hashedSeed) / 2.0);
+    return LUA_DRAW(g, (advanced + g->hashedSeed) / 2.0);
 }
 
 // A draw on a register-resident stream: *st is a private variable that starts as NaN.
@@ -320,7 +395,7 @@ FORCE_INLINE double rnd_reg(Rng *g,
     }
     const double advanced = round13(frac_d(s * 1.72431234 + 2.134453429141));
     *st = advanced;
-    return lua_draw((advanced + g->hashedSeed) / 2.0);
+    return LUA_DRAW(g, (advanced + g->hashedSeed) / 2.0);
 }
 
 #define RND(f, s, a, r) rnd(&g, prefix, keyChars, keyLens, keySlots, (f), (s), (a), (r))
@@ -578,6 +653,33 @@ FORCE_INLINE double best_per_match_from(__constant const int *anteMin, __constan
         }                                                                          \
     } while (0)
 
+// One Buffoon pack card: rarity, the joker, its edition, offered at the next joker slot.
+#if WANT_JOKERS
+#define BUFFOON_CARD(ante_)                                                        \
+    do {                                                                           \
+        const double _rv = RND(F_RARITY, SRC_BUF, (ante_), 0);                     \
+        const int _rar = (_rv > 0.95) ? R_RARE : ((_rv > 0.7) ? R_UNCOMMON : R_COMMON); \
+        const int _pn = (_rar == R_RARE) ? POOL_N_RARE                             \
+                      : ((_rar == R_UNCOMMON) ? POOL_N_UNCOMMON : POOL_N_COMMON);  \
+        const int _fam = (_rar == R_RARE) ? F_JOKER3                               \
+                       : ((_rar == R_UNCOMMON) ? F_JOKER2 : F_JOKER1);             \
+        const int _code = ITEM_CODE(_rar, rnd_index(RND(_fam, SRC_BUF, (ante_), 0), _pn)); \
+        int _ed = 0;                                                               \
+        if (WANT_EDITIONS && (passFlags & ST_EDITIONS)) {                          \
+            _ed = poll_edition(RND(F_EDITION, SRC_BUF, (ante_), 0), edRate, 1.0, 0); \
+        }                                                                          \
+        jokerSlot++;                                                               \
+        OFFER(_code, _ed, (ante_), jokerSlot, SB_PACK);                            \
+    } while (0)
+#endif
+
+#ifndef SPLIT_BUFFOON
+#define SPLIT_BUFFOON 0
+#endif
+#if NUM_PACK_KINDS > 16
+#error "pack kinds are packed 4 bits each"
+#endif
+
 // --- the kernel --------------------------------------------------------------
 
 __kernel void search(
@@ -606,6 +708,7 @@ __kernel void search(
     __constant const uchar  *voucherIgnored,
     __global const int      *remap,
     __constant const int    *anteEnd,        // one past the last stream of each ante
+    __global const ulong    *rngTable,       // leap-ahead table; a placeholder when RNG_TABLE_BITS is 0
     __global double         *state,
     __global int            *hitIndex,         // seed offsets within this chunk
     __global double         *hitScore,
@@ -638,9 +741,35 @@ __kernel void search(
     // per lane, so a --local-size above 512 does not leave lanes idle.
     const uint lid = get_local_id(0);
     const uint lsz = get_local_size(0);
+#if COMPACT
+    const uint grabPerGroup = GRAB_SIZE;
+#else
     const uint grabPerGroup = max(512u, lsz);
+#endif
 
     __local uint lBase;
+
+#if RNG_TABLE_BITS == 4
+    __local ulong rtLocal[RT_ENTRIES];
+    for (uint i = lid; i < RT_ENTRIES; i += lsz) rtLocal[i] = rngTable[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    g.rtab = rtLocal;
+#elif RNG_TABLE_BITS
+    g.rtab = rngTable;
+#else
+    (void)rngTable;
+#endif
+
+#if COMPACT
+    // Two rounds instead of one loop per lane. Round 1 runs only the prefilter stages on
+    // every seed of the grab and queues the survivors; round 2 runs the full scan on the
+    // queue, a whole group's worth at a time, so the lanes of a warp all do the expensive
+    // part together instead of most of them idling while a few go deep. Fewer than a
+    // group's worth left over wait for the next grab; the last grab drains everything.
+    __local uint lQueue[WG_SIZE + GRAB_SIZE];
+    __local uint lQn;
+    if (lid == 0) lQn = 0u;
+#endif
 
 #if USE_LOCAL_PREFIX
     __local double prefixPool[WG_SIZE * PREFIX_STRIDE];
@@ -655,10 +784,30 @@ __kernel void search(
         barrier(CLK_LOCAL_MEM_FENCE);
 
         const uint grabbed = lBase;
+#if COMPACT
+        const int drain = grabbed >= (uint)chunkSize;
+        const uint grabEnd = drain ? grabbed : min(grabbed + grabPerGroup, (uint)chunkSize);
+        uint queued = 0u;
+      for (int phase = 0; phase < 2; phase++) {
+        uint phaseN;
+        if (phase == 0) {
+            phaseN = grabEnd - grabbed;
+        } else {
+            barrier(CLK_LOCAL_MEM_FENCE);
+            queued = lQn;
+            phaseN = drain ? queued : (queued / lsz) * lsz;
+        }
+    for (uint w = lid; w < phaseN; w += lsz) {
+        const uint seedOff = (phase == 0) ? grabbed + w : lQueue[w];
+        const int passLo = (phase == 0) ? 0 : NUM_STAGES;
+        const int passHi = (phase == 0) ? NUM_STAGES - 1 : NUM_STAGES;
+#else
         if (grabbed >= (uint)chunkSize) break;
         const uint grabEnd = min(grabbed + grabPerGroup, (uint)chunkSize);
 
     for (uint seedOff = grabbed + lid; seedOff < grabEnd; seedOff += lsz) {
+        const int passLo = 0, passHi = NUM_STAGES;
+#endif
 
         g.seedLen = seed_for_index(baseIndex + (ulong)seedOff, &g.seedLo, &g.seedHi);
 
@@ -683,7 +832,7 @@ __kernel void search(
 #endif
 
         // Passes 0..NUM_STAGES-1 are prefilter stages; pass NUM_STAGES is the full scan.
-        for (int pass = 0; pass <= NUM_STAGES; pass++) {
+        for (int pass = passLo; pass <= passHi; pass++) {
             const int isFull = (pass == NUM_STAGES);
             int passFlags, lastAnte;
             uint passMask;
@@ -702,7 +851,15 @@ __kernel void search(
 
             // Fresh generator state for every pass. Streams with no ante of their own (the
             // Soul's legendary queue) are cleared here; each ante's slice as it starts.
+#if STATE_TAGS
+            g.tagRun = 0UL;
+            g.runBase = anteEnd[MAX_SEARCH_ANTE];
+            g.tagAnte = 0UL;
+            g.anteBase = 0;
+            g.anteLen = 0;
+#else
             for (int i = anteEnd[MAX_SEARCH_ANTE]; i < nStreams; i++) state[(size_t)i * gsize + gid] = NAN;
+#endif
             g.overflow = 0;
             m.found = 0UL;
             m.unmet = popcount(passMask);
@@ -722,9 +879,15 @@ __kernel void search(
 
             for (int ante = 1; ante <= lastAnte && !abandoned && !g.overflow; ante++) {
 
+#if STATE_TAGS
+                g.anteBase = anteEnd[ante - 1];
+                g.anteLen = anteEnd[ante] - g.anteBase;
+                g.tagAnte = 0UL;
+#else
                 for (int i = anteEnd[ante - 1]; i < anteEnd[ante]; i++) {
                     state[(size_t)i * gsize + gid] = NAN;
                 }
+#endif
 
                 // ---- boss blind (full pass only). One run-long stream; the choice is among
                 // bosses not yet seen and allowed this early. Mirrors SeedAnalyzer.nextBoss. ----
@@ -818,9 +981,46 @@ __kernel void search(
                 const int numPacks = (ante == 1) ? 4 : 6;
                 int jokerSlot = 0;
 
+                // Split Buffoon cards (stages only). A stage decides only from counts at the
+                // end of an ante, and Buffoon cards draw from streams nothing else reads, so
+                // the ante's pack kinds can be rolled first and all of its Buffoon cards dealt
+                // in one loop -- each stream still sees its draws in the same order. Inline,
+                // a wave runs the whole card loop at every pack slot where any one lane has a
+                // Buffoon pack (~9% of packs), for the largest pack among them, with the other
+                // lanes masked off; in one loop it runs each lane's own total.
+                const int split = SPLIT_BUFFOON && !isFull;
+                uint preKinds = 0u;
+                if (split) {
+                    int bufCards = 0;
+                    for (int p = 0; p < numPacks; p++) {
+                        int kind;
+                        if (ante <= 2 && !generatedFirstPack) {
+                            generatedFirstPack = 1;
+                            kind = BUFFOON_PACK_INDEX;
+                        } else {
+                            const double poll = RND(F_SHOP_PACK, 0, ante, 0) * PACK_TOTAL_WEIGHT;
+                            kind = NUM_PACK_KINDS - 1;
+                            for (int i = 0; i < NUM_PACK_KINDS; i++) {
+                                if (packCum[i] >= poll) { kind = i; break; }
+                            }
+                        }
+                        preKinds |= (uint)kind << (4 * p);
+                        if (packFamily[kind] == PACK_BUFFOON) bufCards += packSize[kind];
+                    }
+#if WANT_JOKERS
+                    if (passFlags & ST_JOKERS) {
+                        for (int c = 0; c < bufCards && !g.overflow; c++) {
+                            BUFFOON_CARD(ante);
+                        }
+                    }
+#endif
+                }
+
                 for (int p = 0; p < numPacks && !g.overflow; p++) {
                     int kind;
-                    if (ante <= 2 && !generatedFirstPack) {
+                    if (split) {
+                        kind = (int)((preKinds >> (4 * p)) & 0xFu);
+                    } else if (ante <= 2 && !generatedFirstPack) {
                         generatedFirstPack = 1;
                         kind = BUFFOON_PACK_INDEX;
                     } else {
@@ -837,24 +1037,9 @@ __kernel void search(
                     if (family == PACK_BUFFOON) {
 #if WANT_JOKERS
                         // No duplicate prevention (the player may hold Showman).
-                        if (passFlags & ST_JOKERS) {
+                        if ((passFlags & ST_JOKERS) && !split) {
                         for (int c = 0; c < size && !g.overflow; c++) {
-                            const double rv = RND(F_RARITY, SRC_BUF, ante, 0);
-                            const int rarity = (rv > 0.95) ? R_RARE : ((rv > 0.7) ? R_UNCOMMON : R_COMMON);
-                            const int poolN = (rarity == R_RARE) ? POOL_N_RARE
-                                            : ((rarity == R_UNCOMMON) ? POOL_N_UNCOMMON : POOL_N_COMMON);
-                            const int fam = (rarity == R_RARE) ? F_JOKER3
-                                          : ((rarity == R_UNCOMMON) ? F_JOKER2 : F_JOKER1);
-                            const int code = ITEM_CODE(rarity, rnd_index(RND(fam, SRC_BUF, ante, 0), poolN));
-
-                            int edition = 0;
-#if WANT_EDITIONS
-                            if (passFlags & ST_EDITIONS) {
-                                edition = poll_edition(RND(F_EDITION, SRC_BUF, ante, 0), edRate, 1.0, 0);
-                            }
-#endif
-                            jokerSlot++;
-                            OFFER(code, edition, ante, jokerSlot, SB_PACK);
+                            BUFFOON_CARD(ante);
                         }
                         }
 #endif
@@ -1046,6 +1231,10 @@ __kernel void search(
         }
 
         if (killed) continue;
+#if COMPACT
+        // Round 1 only decides who is worth a full scan.
+        if (phase == 0) { lQueue[atomic_inc(&lQn)] = seedOff; continue; }
+#endif
 
         if (g.overflow) {
             const int slot = atomic_inc(&hitCount[1]);
@@ -1070,5 +1259,19 @@ __kernel void search(
             }
         }
     }   // end of this grab's seeds
+#if COMPACT
+        if (phase == 1) {
+            // Move the leftovers (fewer than a group's worth) to the front of the queue.
+            const uint rem = queued - phaseN;
+            uint carry = 0u;
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (lid < rem) carry = lQueue[phaseN + lid];
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (lid < rem) lQueue[lid] = carry;
+            if (lid == 0) lQn = rem;
+        }
+      }   // end of the two rounds
+        if (drain) break;
+#endif
     }   // end of the work-pulling loop
 }

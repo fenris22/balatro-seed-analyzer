@@ -126,10 +126,35 @@ object ClSearch {
     var FORCE_INLINE_DEVICE_FUNCS = true
 
     /**
-     * Where the seed-prefix cache lives: "auto" (shared memory on Nvidia, private elsewhere),
+     * Where the seed-prefix cache lives: "auto" (shared memory only if it fits without shrinking the work-group size),
      * "local" (shared memory) or "private". Set from --prefix-cache.
      */
     var PREFIX_CACHE = "auto"
+
+    /**
+     * How the kernel knows a stream is untouched this pass: "tags" keeps a bit per stream in
+     * registers, "clear" writes NaN over the stream's slot in the state buffer (the original
+     * scheme), "auto" uses tags whenever every ante's streams fit 64 bits. Set from --state-reset.
+     */
+    var STATE_RESET = "auto"
+
+    /**
+     * "on" runs the prefilter stages on a whole grab first and the full scan only on the
+     * survivors, a group at a time; "off" runs each seed through every pass in turn. Only
+     * matters when the search has prefilter stages. "auto" is off until benchmarks say
+     * otherwise. Set from --two-round.
+     */
+    var TWO_ROUND = "auto"
+
+    /**
+     * "on" deals all of an ante's Buffoon pack cards in one loop in the prefilter stages,
+     * after rolling the ante's pack kinds, instead of inside each pack. Same draws on every
+     * stream, far less divergence. "auto" is on. Set from --split-packs.
+     */
+    var SPLIT_PACKS = "auto"
+
+    /** Leap-ahead RNG table width: 0 (off), 4, 8 or 16 bits, or -1 for auto (off). Set from --rng-table. */
+    var RNG_TABLE_BITS = -1
 
     class Unsupported(msg: String) : Exception(msg)
 
@@ -261,6 +286,15 @@ object ClSearch {
          */
         val anteEnd = IntArray(maxAnte + 1)
 
+        /** Most memory streams any one ante has, and how many belong to no ante. */
+        var widestAnte = 0
+            private set
+        var runStreams = 0
+            private set
+
+        /** True when both fit the kernel's 64-bit touched masks (STATE_TAGS). */
+        val tagsFit: Boolean get() = widestAnte <= 64 && runStreams <= 64
+
         /** Streams that live in the global state buffer. Everything past this is a register. */
         var stateCount = 0
             private set
@@ -330,6 +364,8 @@ object ClSearch {
             if (wantBosses) add(RngKeys.BOSS, 0, 0)
             stateCount = ids.size
             sealed = true
+            widestAnte = (1..maxAnte).maxOfOrNull { anteEnd[it] - anteEnd[it - 1] } ?: 0
+            runStreams = stateCount - anteEnd[maxAnte]
 
             // Register-resident shop streams. Shop jokers are never deduplicated and shop
             // tarots never resample, so each needs exactly one slot.
@@ -638,6 +674,9 @@ object ClSearch {
             ?: java.io.File("opencl/search.cl").takeIf { it.exists() }?.readText()
             ?: error("search.cl not found on the classpath or at opencl/search.cl")
 
+    /** The experimental kernel switches, resolved from their "auto" settings for one run. */
+    private data class KernelOpts(val stateTags: Boolean, val twoRound: Boolean, val rngBits: Int, val splitPacks: Boolean)
+
     private fun buildDefines(
         conditions: Array<Condition>,
         detail: Detail,
@@ -648,8 +687,14 @@ object ClSearch {
         stages: List<PrefilterStage>,
         globalSize: Long,
         localSize: Long,
+        kernelOpts: KernelOpts,
     ): String = buildString {
         fun d(name: String, value: Any) = appendLine("#define $name $value")
+        d("STATE_TAGS", if (kernelOpts.stateTags) 1 else 0)
+        d("COMPACT", if (kernelOpts.twoRound) 1 else 0)
+        d("SPLIT_BUFFOON", if (kernelOpts.splitPacks) 1 else 0)
+        d("GRAB_SIZE", maxOf(512L, localSize))
+        d("RNG_TABLE_BITS", kernelOpts.rngBits)
         d("NUM_CONDS", conditions.size)
         d("MAX_SEARCH_ANTE", maxSearchAnte)
         d("SHOP_ITEMS", shopItems)
@@ -676,10 +721,7 @@ object ClSearch {
         d("EAGER_PREFIX", if (EAGER_PREFIX) 1 else 0)
         d("SLOT_KEYLEN_INIT", streams.slotKeyLens.joinToString(",", "{", "}"))
         d("WG_SIZE", localSize)
-        // Shared memory for the prefix cache only where there is enough of it. An H100 SM
-        // has 228 KB and hosts several groups happily; a CDNA3 compute unit has 64 KB
-        // total, so a 256-thread group would take half of it and collapse occupancy. AMD's
-        // compiler also handles the private array better than Nvidia's does.
+        // Shared memory for the prefix cache only where there is room for it (decided in run()).
         val localPrefix = if (useLocalPrefix) 1 else 0
         d("USE_LOCAL_PREFIX", localPrefix)
         d("FORCE_INLINE_ON", if (FORCE_INLINE_DEVICE_FUNCS) 1 else 0)
@@ -946,6 +988,41 @@ object ClSearch {
         args.add(keep(roInts(streams.remap)))
         args.add(keep(roInts(streams.anteEnd)))
 
+        val kernelOpts = KernelOpts(
+            stateTags = when (STATE_RESET) {
+                "tags" -> {
+                    if (!streams.tagsFit) throw Unsupported("--state-reset tags: this search has ${streams.widestAnte} " +
+                            "streams in one ante and ${streams.runStreams} run-long ones, the tag masks hold 64 each")
+                    true
+                }
+                "clear" -> false
+                else -> streams.tagsFit
+            },
+            twoRound = TWO_ROUND == "on" && stages.isNotEmpty(),
+            rngBits = if (RNG_TABLE_BITS < 0) 0 else RNG_TABLE_BITS,
+            splitPacks = SPLIT_PACKS != "off",
+        )
+        // Leap-ahead table, or an 8-byte placeholder so the kernel's parameter list never changes.
+        val rngTable = if (kernelOpts.rngBits > 0) RngTable.build(kernelOpts.rngBits) else LongArray(1)
+        args.add(keep(clCreateBuffer(context, CL_MEM_READ_ONLY or CL_MEM_COPY_HOST_PTR,
+            rngTable.size.toLong() * Sizeof.cl_ulong, Pointer.to(rngTable), null)))
+        if (!quiet) {
+            println("${label}Stream reset: ${if (kernelOpts.stateTags) "tags" else "clear"}" +
+                    (if (STATE_RESET == "auto") " (auto)" else "") +
+                    " | two-round: ${if (kernelOpts.twoRound) "on" else "off"}" +
+                    (if (TWO_ROUND == "on" && stages.isEmpty()) " (no prefilter stages)" else "") +
+                    " | RNG table: ${if (kernelOpts.rngBits > 0) "${kernelOpts.rngBits}-bit, ${rngTable.size * 8L / 1024} KB" else "off"}" +
+                    " | split packs: ${if (kernelOpts.splitPacks) "on" else "off"}" + (if (SPLIT_PACKS == "auto") " (auto)" else ""))
+        }
+        RunStatus.noteGpuSetting("Stream reset", (if (kernelOpts.stateTags) "tags" else "clear") +
+                if (STATE_RESET == "auto") " (auto)" else "")
+        RunStatus.noteGpuSetting("Two-round scan", (if (kernelOpts.twoRound) "on" else "off") +
+                if (TWO_ROUND == "auto") " (auto)" else "")
+        RunStatus.noteGpuSetting("RNG table", (if (kernelOpts.rngBits > 0) "${kernelOpts.rngBits}-bit" else "off") +
+                if (RNG_TABLE_BITS < 0) " (auto)" else "")
+        RunStatus.noteGpuSetting("Split pack cards", (if (kernelOpts.splitPacks) "on" else "off") +
+                if (SPLIT_PACKS == "auto") " (auto)" else "")
+
         // Only the memory-resident streams need space; shop streams live in registers.
         val bState = keep(clCreateBuffer(context, CL_MEM_READ_WRITE,
             maxOf(1, streams.stateCount).toLong() * globalSize * Sizeof.cl_double, null, null))
@@ -963,17 +1040,24 @@ object ClSearch {
         args.add(bState); args.add(bHitIndex); args.add(bHitScore); args.add(bHitCount)
         args.add(bOverflow); args.add(bWork)
 
-        // Nvidia demotes the dynamically indexed prefix cache to per-thread local memory
-        // whatever the inlining, so it goes to shared memory there. AMD keeps it private.
         val vendor = deviceInfo(device, CL_DEVICE_VENDOR).lowercase()
         val isNvidia = vendor.contains("nvidia")
+        // Shared memory each work item would need for its slice of the prefix cache.
+        val cacheBytes = (streams.lenSlotCount or 1) * 8L
+        // Auto: the shared-memory cache only when the device has room for it at the work-group
+        // size the kernel would get anyway. If it would force smaller groups (fewer, busier
+        // groups per compute unit), the private cache is faster; measured ~8% on a run where the
+        // shared cache pushed the group size from 256 down to 64.
         val useLocalPrefix = when (PREFIX_CACHE) {
             "local" -> true
             "private" -> false
-            else -> isNvidia
+            else -> {
+                val localMem = deviceLong(device, DEVICE_LOCAL_MEM_SIZE)
+                val want = if (LOCAL_SIZE > 0) LOCAL_SIZE else autoLocalSize(device, 0L)
+                localMem > 0 && want * cacheBytes * 4 <= localMem
+            }
         }
-        // Shared memory each work item needs: its slice of the prefix cache, if that lives there.
-        val ldsPerItem = if (useLocalPrefix) (streams.lenSlotCount or 1) * 8L else 0L
+        val ldsPerItem = if (useLocalPrefix) cacheBytes else 0L
         var localSize = if (LOCAL_SIZE > 0) LOCAL_SIZE else autoLocalSize(device, ldsPerItem)
         val localMem = deviceLong(device, DEVICE_LOCAL_MEM_SIZE)
         if (useLocalPrefix && localSize * ldsPerItem + 64 > localMem) {
@@ -1003,7 +1087,7 @@ object ClSearch {
 
         fun build(ls: Long): Pair<cl_program, cl_kernel> {
             val source = buildDefines(conditions, detail, maxSearchAnte, shopItems, streams, useLocalPrefix,
-                stages, globalSize, ls) + "\n" + loadSource()
+                stages, globalSize, ls, kernelOpts) + "\n" + loadSource()
             val program = clCreateProgramWithSource(context, 1, arrayOf(source), null, null)
             try {
                 clBuildProgram(program, 0, null, buildOptions, null, null)

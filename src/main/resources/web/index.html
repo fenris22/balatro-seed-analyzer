@@ -401,6 +401,10 @@
               <div class="field"><label for="sPrefix">Prefix cache</label><select class="inp" id="sPrefix" data-setting="prefixCache"><option value="auto">Auto</option><option value="local">Shared memory</option><option value="private">Private</option></select><span class="hint">Where each work item keeps its seed hashes</span></div>
               <div class="field"><span class="lbl">Compiler</span><label class="toggle"><input type="checkbox" id="sInline"> Force inlining</label><span class="hint">On by default</span></div>
               <div class="field"><span class="lbl">Hashing</span><label class="toggle"><input type="checkbox" id="sEager"> Eager prefix hashing</label><span class="hint">Off by default: hashes several prefixes at once, which only pays off on some GPUs</span></div>
+              <div class="field"><label for="sReset">Stream reset</label><select class="inp" id="sReset" data-setting="stateReset"><option value="auto">Auto</option><option value="tags">Tags</option><option value="clear">Clear</option></select><span class="hint">How the GPU marks random streams unused for each seed. Tags keeps a bit per stream in registers; Clear writes every slot in memory</span></div>
+              <div class="field"><label for="sTwoRound">Two-round scan</label><select class="inp" id="sTwoRound" data-setting="twoRound"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select><span class="hint">Quick checks on a batch of seeds first, then the full scan on the survivors together. Only matters when the search has quick checks</span></div>
+              <div class="field"><label for="sSplitPacks">Split pack cards</label><select class="inp" id="sSplitPacks" data-setting="splitPacks"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select><span class="hint">In the quick checks, deals all of an ante's Buffoon cards in one loop so the GPU's lanes stay in step</span></div>
+              <div class="field"><label for="sRngTable">RNG table</label><select class="inp" id="sRngTable" data-setting="rngTable"><option value="auto">Auto</option><option value="off">Off</option><option value="4">4-bit (8 KB)</option><option value="8">8-bit (64 KB)</option><option value="16">16-bit (8 MB)</option></select><span class="hint">Replaces the random generator's step-by-step math with table lookups</span></div>
             </div>
             <details class="more" style="margin-top:14px">
               <summary>NVIDIA only</summary>
@@ -566,7 +570,8 @@
   const KEPT_SETTINGS = ["startIndex", "endIndex", "maxResults", "checkpointEvery"];
   /** The automatic GPU settings, whatever the program was started with. */
   const GPU_AUTO = { chunk: "auto", localSize: "auto", globalSize: 4096, calibrationSeeds: 4000000,
-    prefixCache: "auto", forceInline: true, eagerPrefix: false, nvRegisters: "auto" };
+    prefixCache: "auto", forceInline: true, eagerPrefix: false, nvRegisters: "auto",
+    stateReset: "auto", twoRound: "auto", rngTable: "auto", splitPacks: "auto" };
   function save() {
     try {
       const kept = {};

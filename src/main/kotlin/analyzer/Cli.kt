@@ -36,6 +36,14 @@ data class RunOptions(
     /** auto, local or private. */
     val prefixCache: String = "auto",
     val forceInline: Boolean = true,
+    /** auto, tags or clear: how the kernel marks streams untouched. */
+    val stateReset: String = "auto",
+    /** auto, on or off: prefilter first, then full scans on the survivors together. */
+    val twoRound: String = "auto",
+    /** auto, on or off: deal a stage's Buffoon pack cards in one loop per ante. */
+    val splitPacks: String = "auto",
+    /** Leap-ahead RNG table width: -1 auto, 0 off, 4, 8 or 16. */
+    val rngTable: Int = -1,
 ) {
     val seedsToCount: Long get() = endIndex - startIndex
 
@@ -89,7 +97,15 @@ object Cli {
                 "32 on H100/A100, 40 on RTX 30/40; 0 = compiler's choice)"),
         Flag("--eager-prefix", null, "Hash every seed prefix up front, several at once (faster on some GPUs; benchmark it)"),
         Flag("--prefix-cache", "MODE", "Where the seed-prefix cache lives: auto, local (shared memory) or private " +
-                "(default auto: local on Nvidia, private elsewhere)"),
+                "(default auto: local only if it fits without shrinking the work-group size)"),
+        Flag("--state-reset", "MODE", "How the GPU marks random streams unused for each seed: auto, tags " +
+                "(a bit per stream in registers) or clear (write every slot in memory; the old way). Default auto: tags when they fit"),
+        Flag("--two-round", "MODE", "auto, on or off: run the quick prefilter checks on a batch of seeds first, " +
+                "then the full scan only on the survivors, together (default auto: off; benchmark it)"),
+        Flag("--split-packs", "MODE", "auto, on or off: in the prefilter checks, roll an ante's pack kinds " +
+                "first and deal all its Buffoon cards in one loop, so GPU lanes stay in step (default auto: on)"),
+        Flag("--rng-table", "BITS", "auto, off, 4, 8 or 16: replace the random generator's 44 dependent steps " +
+                "with table lookups (4: 8 KB in shared memory, 8: 64 KB, 16: 8 MB). Default auto: off; benchmark it"),
         Flag("--no-inline", null, "Let the GPU compiler decide what to inline instead of forcing it"),
         Flag("--examine", "SEED", "Print antes 1-8 of one seed in full and exit, without searching"),
         Flag("--conditions", "FILE", "Search the conditions in FILE (saved from the web page) without the " +
@@ -170,6 +186,22 @@ object Cli {
         return r
     }
 
+    /** --rng-table: auto (-1), off (0), or a table width. */
+    fun parseRngTable(raw: String): Int {
+        val v = raw.trim().lowercase()
+        if (v == "auto" || v.isEmpty()) return -1
+        if (v == "off" || v == "0") return 0
+        val bits = v.toIntOrNull()
+        if (bits == null || bits !in RngTable.SUPPORTED) throw CliError("--rng-table must be auto, off, 4, 8 or 16")
+        return bits
+    }
+
+    fun parseChoice(flag: String, raw: String, vararg allowed: String): String {
+        val v = raw.trim().lowercase()
+        if (v !in allowed) throw CliError("$flag must be ${allowed.dropLast(1).joinToString(", ")} or ${allowed.last()}")
+        return v
+    }
+
     /**
      * The --conditions value, found before the full parse: the file can carry settings of
      * its own, which become the defaults the other flags override.
@@ -245,6 +277,10 @@ object Cli {
                     if (m !in setOf("auto", "local", "private")) throw CliError("--prefix-cache must be auto, local or private")
                     o.copy(prefixCache = m)
                 }
+                "--state-reset" -> o.copy(stateReset = parseChoice(name, value, "auto", "tags", "clear"))
+                "--two-round" -> o.copy(twoRound = parseChoice(name, value, "auto", "on", "off"))
+                "--split-packs" -> o.copy(splitPacks = parseChoice(name, value, "auto", "on", "off"))
+                "--rng-table" -> o.copy(rngTable = parseRngTable(value))
                 "--host" -> o.copy(host = value.trim())
                 "--port" -> {
                     val p = toInt(name, value)
