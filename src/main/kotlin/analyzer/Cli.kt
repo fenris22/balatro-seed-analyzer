@@ -83,7 +83,7 @@ object Cli {
         Flag("--calibration-seeds", "N", "Seeds sampled to pick a starting cutoff; 0 skips it (default ${fmt(d.calibrationSeeds)})"),
         Flag("--global-size", "N", "GPU work items per compute unit (default ${d.globalSize}; " +
                 "power of 2 from 2048 to 16384 recommended)"),
-        Flag("--local-size", "N", "GPU work-group size (default ${d.localSize}; power of 2 from 64 to 256 recommended)"),
+        Flag("--local-size", "N", "GPU work-group size (default ${if (d.localSize <= 0) "auto: the largest up to 256 the device and kernel allow" else d.localSize.toString()})"),
         Flag("--chunk", "N", "Seeds per GPU launch (default ${if (d.chunk <= 0) "auto: sized to about a second per launch" else fmt(d.chunk.toLong())})"),
         Flag("--nv-registers", "N", "Nvidia only: cap registers per thread so more threads fit (default auto: " +
                 "32 on H100/A100, 40 on RTX 30/40; 0 = compiler's choice)"),
@@ -229,7 +229,7 @@ object Cli {
                 "--checkpoint" -> o.copy(checkpointEvery = parseCount(name, value))
                 "--calibration-seeds" -> o.copy(calibrationSeeds = parseCount(name, value))
                 "--global-size" -> o.copy(globalSize = toInt(name, value))
-                "--local-size" -> o.copy(localSize = toInt(name, value))
+                "--local-size" -> o.copy(localSize = if (value.trim().equals("auto", ignoreCase = true)) 0 else toInt(name, value))
                 "--chunk" -> o.copy(chunk = if (value.trim().equals("auto", ignoreCase = true)) 0 else toInt(name, value))
                 "--examine" -> {
                     val seed = value.trim().uppercase()
@@ -278,11 +278,11 @@ object Cli {
         if (o.startIndex >= o.endIndex) {
             throw CliError("--start-index ${"%,d".format(o.startIndex)} must be below --end-index ${"%,d".format(o.endIndex)}")
         }
-        if (o.localSize < 1 || o.localSize > LOCAL_SIZE_LIMIT) {
-            throw CliError("--local-size must be between 1 and $LOCAL_SIZE_LIMIT")
+        if (o.localSize < 0 || o.localSize > LOCAL_SIZE_LIMIT) {
+            throw CliError("--local-size must be auto or between 1 and $LOCAL_SIZE_LIMIT")
         }
         if (o.globalSize < 1) throw CliError("--global-size must be at least 1")
-        if (o.globalSize % o.localSize != 0) {
+        if (o.localSize > 0 && o.globalSize % o.localSize != 0) {
             throw CliError("--global-size ${o.globalSize} must be a multiple of --local-size ${o.localSize}")
         }
         if (o.chunk < 0) throw CliError("--chunk must be auto or a positive number")
@@ -291,8 +291,8 @@ object Cli {
         if (!isPow2(o.globalSize.toLong()) || o.globalSize !in 2048..16384) {
             out.add("--global-size ${o.globalSize} is outside the recommended range (a power of 2 from 2048 to 16384).")
         }
-        if (!isPow2(o.localSize.toLong()) || o.localSize !in 64..256) {
-            out.add("--local-size ${o.localSize} is outside the recommended range (a power of 2 from 64 to 256).")
+        if (o.localSize > 0 && (!isPow2(o.localSize.toLong()) || o.localSize !in 32..1024)) {
+            out.add("--local-size ${o.localSize} is not a power of 2 from 32 to 1024.")
         }
         if (o.chunk > 0 && o.chunk !in 2_000_000..64_000_000) {
             out.add("--chunk ${"%,d".format(o.chunk)} is outside the recommended range (2m to 64m).")

@@ -225,7 +225,8 @@ fun applySettings(base: RunOptions, raw: Any?, validate: Boolean = true): RunOpt
     }
     count("calibrationSeeds", "--calibration-seeds")?.let { o = o.copy(calibrationSeeds = it) }
     int("globalSize", "--global-size")?.let { o = o.copy(globalSize = it) }
-    int("localSize", "--local-size")?.let { o = o.copy(localSize = it) }
+    if (s["localSize"]?.toString()?.trim()?.equals("auto", ignoreCase = true) == true) o = o.copy(localSize = 0)
+    else int("localSize", "--local-size")?.let { o = o.copy(localSize = it) }
     if (s["chunk"]?.toString()?.trim()?.equals("auto", ignoreCase = true) == true) o = o.copy(chunk = 0)
     else int("chunk", "--chunk")?.let { o = o.copy(chunk = it) }
     s["nvRegisters"]?.let { v ->
@@ -260,7 +261,7 @@ fun settingsToJson(o: RunOptions): Map<String, Any?> = mapOf(
     "checkpointEvery" to o.checkpointEvery,
     "calibrationSeeds" to o.calibrationSeeds,
     "globalSize" to o.globalSize,
-    "localSize" to o.localSize,
+    "localSize" to if (o.localSize <= 0) "auto" else o.localSize,
     "chunk" to if (o.chunk <= 0) "auto" else o.chunk,
     "nvRegisters" to if (o.nvRegisters < 0) "auto" else o.nvRegisters,
     "eagerPrefix" to o.eagerPrefix,

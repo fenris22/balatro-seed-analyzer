@@ -59,6 +59,13 @@ object RunStatus {
 
     private val window = ArrayDeque<LongArray>()
 
+    /** GPU settings the run is using, automatic or not, for the page. In the order set. */
+    private val gpuSettings = java.util.LinkedHashMap<String, String>()
+
+    fun noteGpuSetting(name: String, value: String) = synchronized(gpuSettings) { gpuSettings[name] = value }
+
+    fun gpuSettingsSnapshot(): Map<String, String> = synchronized(gpuSettings) { LinkedHashMap(gpuSettings) }
+
     fun begin(total: Long, start: Long, hasRequired: Boolean) {
         runId++
         phase = "planning"; message = null
@@ -67,6 +74,7 @@ object RunStatus {
         device = ""; gpuNote = null; this.hasRequired = hasRequired
         hits.reset(); sampleSeeds = 0; sampleHits = 0; calibrationSeeds = 0; calibrationHits = 0
         synchronized(window) { window.clear() }
+        synchronized(gpuSettings) { gpuSettings.clear() }
     }
 
     /** Called after every GPU chunk and every CPU progress tick. */
@@ -201,7 +209,7 @@ fun runSearch(config: SearchConfig): List<SeedResult> {
             "(${"%,d".format(seedsToCount)}), max results $maxResults, " +
             (if (checkpointEvery > 0) "checkpoint every ${"%,d".format(checkpointEvery)}, " else "checkpoints off, ") +
             "calibration ${"%,d".format(calibrationSeeds)}, " +
-            (if (useGpu) "GPU global ${opts.globalSize}/CU, local ${opts.localSize}, chunk " +
+            (if (useGpu) "GPU global ${opts.globalSize}/CU, local ${if (opts.localSize <= 0) "auto" else opts.localSize}, chunk " +
                     (if (opts.chunk <= 0) "auto" else "%,d".format(opts.chunk)) +
                     (if (opts.nvRegisters >= 0) ", nv registers ${if (opts.nvRegisters == 0) "compiler's choice" else opts.nvRegisters}" else "") +
                     (if (opts.eagerPrefix) ", eager prefix" else "") +

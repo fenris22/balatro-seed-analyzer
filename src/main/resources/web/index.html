@@ -339,6 +339,7 @@
           <div class="stat"><div class="k">Results kept</div><div class="v" id="stHeld">—</div><div class="s" id="stHeldSub"></div></div>
           <div class="stat"><div class="k">Score cutoff</div><div class="v" id="stCutoff">—</div><div class="s">Seeds must beat this</div></div>
         </div>
+        <div class="small muted hidden" id="gpuUsed"></div>
         <div class="msgs" id="runNotes"></div>
         <div class="msgs" id="runMsgs"></div>
       </div>
@@ -390,15 +391,24 @@
 
         <details class="more" style="margin-top:12px">
           <summary>GPU tuning</summary>
-          <div class="inner grid-side">
-            <div class="field"><label for="sChunk">Seeds per launch</label><input class="inp" id="sChunk" data-setting="chunk" placeholder="auto"><span class="hint">auto sizes each launch to about a second</span></div>
-            <div class="field"><label for="sGlobal">Work items per CU</label><input class="inp" id="sGlobal" data-setting="globalSize"><span class="hint">Power of 2, 2048–16384</span></div>
-            <div class="field"><label for="sLocal">Work-group size</label><input class="inp" id="sLocal" data-setting="localSize"><span class="hint">Power of 2, 64–256</span></div>
-            <div class="field"><label for="sCal">Calibration seeds</label><input class="inp" id="sCal" data-setting="calibrationSeeds"><span class="hint">Sampled to set the score cutoff; 0 skips</span></div>
-            <div class="field"><label for="sNvRegs">Nvidia register cap</label><input class="inp" id="sNvRegs" data-setting="nvRegisters" placeholder="auto"><span class="hint">auto fills the SM (32 on H100); 0 = compiler's choice</span></div>
-            <div class="field"><label for="sPrefix">Prefix cache</label><select class="inp" id="sPrefix" data-setting="prefixCache"><option value="auto">Auto</option><option value="local">Shared memory</option><option value="private">Private</option></select><span class="hint">Auto: shared on Nvidia, private elsewhere</span></div>
-            <div class="field"><label class="toggle" style="margin-top:22px"><input type="checkbox" id="sInline"> Force inlining</label><span class="hint">Usually faster; try off if registers are high</span></div>
-            <div class="field"><label class="toggle" style="margin-top:22px"><input type="checkbox" id="sEager"> Eager prefix hashing</label><span class="hint">Hashes several prefixes at once; benchmark it</span></div>
+          <div class="inner">
+            <div class="msg info" style="margin-bottom:12px">Everything here is chosen automatically for the GPU each search runs on, and <b>Auto</b> is the fastest choice we know of. Change a setting only to experiment; it applies from the next search.</div>
+            <div class="grid-side">
+              <div class="field"><label for="sChunk">Seeds per launch</label><input class="inp" id="sChunk" data-setting="chunk" placeholder="Auto"><span class="hint">Auto sizes each launch to about a second of GPU time, less on a GPU that drives a display</span></div>
+              <div class="field"><label for="sLocal">Work-group size</label><select class="inp" id="sLocal" data-setting="localSize"><option value="auto">Auto</option><option>32</option><option>64</option><option>128</option><option>256</option><option>512</option><option>1024</option></select><span class="hint">Auto uses the largest up to 256 the device and compiled kernel allow</span></div>
+              <div class="field"><label for="sGlobal">Work items per compute unit</label><input class="inp" id="sGlobal" data-setting="globalSize" placeholder="4096"><span class="hint">How much work each compute unit has queued; 4096 suits most GPUs</span></div>
+              <div class="field"><label for="sCal">Calibration seeds</label><input class="inp" id="sCal" data-setting="calibrationSeeds" placeholder="4m"><span class="hint">Sampled to set the score cutoff; 0 skips it</span></div>
+              <div class="field"><label for="sPrefix">Prefix cache</label><select class="inp" id="sPrefix" data-setting="prefixCache"><option value="auto">Auto</option><option value="local">Shared memory</option><option value="private">Private</option></select><span class="hint">Where each work item keeps its seed hashes</span></div>
+              <div class="field"><span class="lbl">Compiler</span><label class="toggle"><input type="checkbox" id="sInline"> Force inlining</label><span class="hint">On by default</span></div>
+              <div class="field"><span class="lbl">Hashing</span><label class="toggle"><input type="checkbox" id="sEager"> Eager prefix hashing</label><span class="hint">Off by default: hashes several prefixes at once, which only pays off on some GPUs</span></div>
+            </div>
+            <details class="more" style="margin-top:14px">
+              <summary>NVIDIA only</summary>
+              <div class="inner grid-side">
+                <div class="field"><label for="sNvRegs">Register cap per thread</label><input class="inp" id="sNvRegs" data-setting="nvRegisters" placeholder="Auto"><span class="hint">Auto caps registers so each compute unit can run its full number of threads; 0 leaves it to the compiler</span></div>
+              </div>
+            </details>
+            <button class="btn small" id="resetGpu" style="margin-top:14px">Reset all to Auto</button>
           </div>
         </details>
       </div>
@@ -554,6 +564,9 @@
 
   /** Kept between visits. GPU settings are not: they come from how the program was started. */
   const KEPT_SETTINGS = ["startIndex", "endIndex", "maxResults", "checkpointEvery"];
+  /** The automatic GPU settings, whatever the program was started with. */
+  const GPU_AUTO = { chunk: "auto", localSize: "auto", globalSize: 4096, calibrationSeeds: 4000000,
+    prefixCache: "auto", forceInline: true, eagerPrefix: false, nvRegisters: "auto" };
   function save() {
     try {
       const kept = {};
@@ -890,9 +903,15 @@
   function renderSettings() {
     document.querySelectorAll("[data-setting]").forEach((inp) => {
       const k = inp.dataset.setting;
-      inp.value = settings[k] == null ? "" : settings[k];
+      const v = settings[k];
+      if (inp.tagName === "SELECT") inp.value = v == null || v === "" ? "auto" : String(v);
+      else inp.value = v == null || v === "auto" ? "" : v;
       inp.oninput = () => { settings[k] = inp.value.trim(); updateRangeHints(); save(); checkSoon(); };
     });
+    $("resetGpu").onclick = () => {
+      Object.assign(settings, GPU_AUTO);
+      renderSettings(); save(); checkSoon(); toast("GPU settings back to Auto");
+    };
     $("sEager").checked = settings.eagerPrefix === true;
     $("sEager").onchange = (e) => { settings.eagerPrefix = e.target.checked; save(); checkSoon(); };
     $("sInline").checked = settings.forceInline !== false;
@@ -1020,6 +1039,12 @@
     $("runMsgs").replaceChildren(...msgs);
 
     renderGpuChip(s.gpus, s.gpuError);
+    const used = $("gpuUsed");
+    const gs = s.gpuSettings || {};
+    const keys = Object.keys(gs);
+    used.classList.toggle("hidden", !keys.length);
+    used.replaceChildren(el("div", { style: "font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-bottom:2px" }, "GPU settings in use"),
+            ...keys.map((k) => el("div", null, k + ": ", el("span", { style: "color:var(--text)" }, gs[k]))));
     renderResults(s);
     appendLog(s.log, s.logNext);
   }
@@ -1160,7 +1185,13 @@
   // ---------------------------------------------------------------------------
 
   function saveFile() {
-    const data = JSON.stringify(payload(), null, 2);
+    // Only the search itself: GPU tuning belongs to the machine it runs on, and a value saved
+    // here would override that machine's automatic choices when the file is used there.
+    const p = payload();
+    const kept = {};
+    for (const k of KEPT_SETTINGS) if (p.settings[k] !== undefined) kept[k] = p.settings[k];
+    p.settings = kept;
+    const data = JSON.stringify(p, null, 2);
     const a = el("a", { href: URL.createObjectURL(new Blob([data], { type: "application/json" })), download: "conditions.json" });
     document.body.append(a); a.click(); a.remove();
     toast("Saved conditions.json · run it headless with --conditions conditions.json");

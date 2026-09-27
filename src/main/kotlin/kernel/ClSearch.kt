@@ -35,7 +35,16 @@ object ClSearch {
      * Set from --global-size / --local-size before a run; the defaults are in main().
      */
     var GLOBAL_SIZE = 4096
-    var LOCAL_SIZE = 64L
+
+    /** Work-group size, or 0 to pick it per device (see [autoLocalSize]). */
+    var LOCAL_SIZE = 0L
+
+    /** Largest work-group the automatic choice will use. */
+    private const val AUTO_LOCAL_MAX = 256L
+
+    /** CL_DEVICE_MAX_WORK_GROUP_SIZE and CL_DEVICE_LOCAL_MEM_SIZE, from the OpenCL headers. */
+    private const val DEVICE_MAX_WORK_GROUP_SIZE = 0x1004
+    private const val DEVICE_LOCAL_MEM_SIZE = 0x1023
 
     /**
      * Seeds per kernel launch, or 0 for automatic (the default).
@@ -412,6 +421,42 @@ object ClSearch {
      * crawl on a 304-CU accelerator.
      */
     /**
+     * The automatic work-group size, from what the device reports rather than who made it.
+     *
+     * Bigger groups mean fewer groups competing for the shared work counter and fewer
+     * per-group limits to hit on the way to a full compute unit; measured on a latency-bound
+     * run, 256 beat 128 beat 64. So the choice is the largest power of two up to
+     * [AUTO_LOCAL_MAX] that the device accepts, that fits the prefix cache in its shared
+     * memory with room for several groups, and that divides the per-compute-unit work
+     * count. The compiled kernel's own limit is checked after building.
+     */
+    private fun autoLocalSize(device: cl_device_id, ldsPerItem: Long): Long {
+        var ls = AUTO_LOCAL_MAX
+        val deviceMax = deviceLong(device, DEVICE_MAX_WORK_GROUP_SIZE)
+        if (deviceMax > 0) ls = minOf(ls, java.lang.Long.highestOneBit(deviceMax))
+        if (ldsPerItem > 0) {
+            // Leave room for at least four resident groups' worth of prefix cache.
+            val localMem = deviceLong(device, DEVICE_LOCAL_MEM_SIZE)
+            while (ls > 32 && ls * ldsPerItem * 4 > localMem) ls /= 2
+        }
+        while (ls > 1 && GLOBAL_SIZE % ls != 0L) ls /= 2
+        return maxOf(1L, ls)
+    }
+
+    /** A size_t or cl_ulong device property, 0 if the device will not say. */
+    private fun deviceLong(device: cl_device_id, param: Int): Long = try {
+        val v = LongArray(1)
+        clGetDeviceInfo(device, param, 8, Pointer.to(v), null)
+        v[0]
+    } catch (e: Exception) { 0L }
+
+    private fun kernelWorkGroupMax(kernel: cl_kernel, device: cl_device_id): Long = try {
+        val v = LongArray(1)
+        clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE, Sizeof.size_t.toLong(), Pointer.to(v), null)
+        v[0]
+    } catch (e: Exception) { 0L }
+
+    /**
      * How long an automatic chunk should run. A GPU that drives a display has a watchdog
      * that resets the driver if one launch runs for about two seconds: Nvidia reports it
      * (CL_DEVICE_KERNEL_EXEC_TIMEOUT_NV), and on Windows every GPU has one (TDR). Those get
@@ -602,6 +647,7 @@ object ClSearch {
         useLocalPrefix: Boolean,
         stages: List<PrefilterStage>,
         globalSize: Long,
+        localSize: Long,
     ): String = buildString {
         fun d(name: String, value: Any) = appendLine("#define $name $value")
         d("NUM_CONDS", conditions.size)
@@ -629,7 +675,7 @@ object ClSearch {
         d("MAX_LEN_SLOTS", streams.lenSlotCount)
         d("EAGER_PREFIX", if (EAGER_PREFIX) 1 else 0)
         d("SLOT_KEYLEN_INIT", streams.slotKeyLens.joinToString(",", "{", "}"))
-        d("WG_SIZE", LOCAL_SIZE)
+        d("WG_SIZE", localSize)
         // Shared memory for the prefix cache only where there is enough of it. An H100 SM
         // has 228 KB and hosts several groups happily; a CDNA3 compute unit has 64 KB
         // total, so a 256-thread group would take half of it and collapse occupancy. AMD's
@@ -926,20 +972,26 @@ object ClSearch {
             "private" -> false
             else -> isNvidia
         }
-        val ldsBytes = LOCAL_SIZE * (streams.lenSlotCount or 1) * 8
+        // Shared memory each work item needs: its slice of the prefix cache, if that lives there.
+        val ldsPerItem = if (useLocalPrefix) (streams.lenSlotCount or 1) * 8L else 0L
+        var localSize = if (LOCAL_SIZE > 0) LOCAL_SIZE else autoLocalSize(device, ldsPerItem)
+        val localMem = deviceLong(device, DEVICE_LOCAL_MEM_SIZE)
+        if (useLocalPrefix && localSize * ldsPerItem + 64 > localMem) {
+            throw Unsupported("work-group size $localSize needs ${localSize * ldsPerItem / 1024} KB of shared memory " +
+                    "for the prefix cache, the device has ${localMem / 1024} KB; lower --local-size or use --prefix-cache private")
+        }
         if (!quiet) {
-            println("Prefix cache: ${if (useLocalPrefix) "__local (${ldsBytes / 1024} KB/group)" else "private"} " +
+            println("Prefix cache: ${if (useLocalPrefix) "__local (${localSize * ldsPerItem / 1024} KB/group)" else "private"} " +
                     "($vendor)")
         }
-
-        val source = buildDefines(conditions, detail, maxSearchAnte, shopItems, streams, useLocalPrefix,
-            stages, globalSize) +
-                "\n" + loadSource()
         val nvRegs = if (!isNvidia) 0 else if (NV_MAX_REGISTERS == NV_REGISTERS_AUTO) {
             nvidiaAutoRegisters(device).also { (regs, why) ->
                 if (!quiet) println("${label}Register cap: $regs per thread ($why)")
             }.first
         } else NV_MAX_REGISTERS
+        if (isNvidia) RunStatus.noteGpuSetting("Register cap",
+            (if (nvRegs > 0) "$nvRegs per thread" else "compiler's choice") +
+                    if (NV_MAX_REGISTERS == NV_REGISTERS_AUTO) " (auto)" else "")
         val buildOptions = buildString {
             append(BUILD_OPTIONS)
             if (isNvidia && nvRegs > 0) append(" -cl-nv-maxrregcount=$nvRegs")
@@ -949,18 +1001,40 @@ object ClSearch {
         }
         if (!quiet) println("Build options: $buildOptions")
 
-        val program = clCreateProgramWithSource(context, 1, arrayOf(source), null, null)
-        try {
-            clBuildProgram(program, 0, null, buildOptions, null, null)
-        } catch (e: CLException) {
-            val size = LongArray(1)
-            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, null, size)
-            val log = ByteArray(size[0].toInt())
-            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log.size.toLong(), Pointer.to(log), null)
-            println(String(log))
-            throw e
+        fun build(ls: Long): Pair<cl_program, cl_kernel> {
+            val source = buildDefines(conditions, detail, maxSearchAnte, shopItems, streams, useLocalPrefix,
+                stages, globalSize, ls) + "\n" + loadSource()
+            val program = clCreateProgramWithSource(context, 1, arrayOf(source), null, null)
+            try {
+                clBuildProgram(program, 0, null, buildOptions, null, null)
+            } catch (e: CLException) {
+                val size = LongArray(1)
+                clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, null, size)
+                val log = ByteArray(size[0].toInt())
+                clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log.size.toLong(), Pointer.to(log), null)
+                println(String(log))
+                throw e
+            }
+            return program to clCreateKernel(program, "search", null)
         }
-        val kernel = clCreateKernel(program, "search", null)
+
+        var (program, kernel) = build(localSize)
+        // The compiled kernel's own ceiling: how large a group its register and shared
+        // memory use allows on this device. Only known after building, so an automatic
+        // size that turns out too big is rebuilt once at the largest that fits.
+        val kernelMax = kernelWorkGroupMax(kernel, device)
+        if (kernelMax in 1 until localSize) {
+            if (LOCAL_SIZE > 0) {
+                throw Unsupported("--local-size $localSize is more than this kernel allows on this device ($kernelMax)")
+            }
+            clReleaseKernel(kernel); clReleaseProgram(program)
+            localSize = java.lang.Long.highestOneBit(kernelMax)
+            while (GLOBAL_SIZE % localSize != 0L && localSize > 1) localSize /= 2
+            val rebuilt = build(localSize)
+            program = rebuilt.first; kernel = rebuilt.second
+        }
+        if (!quiet) println("${label}Work-group size: $localSize" + (if (LOCAL_SIZE > 0) "" else " (automatic)"))
+        RunStatus.noteGpuSetting("Work-group size", localSize.toString() + if (LOCAL_SIZE > 0) "" else " (auto)")
         if (!quiet) printKernelInfo(kernel, device)
         if (!quiet && isNvidia) printNvidiaRegisters(program, device)
 
@@ -1010,6 +1084,7 @@ object ClSearch {
         val autoChunk = CHUNK <= 0
         val targetSeconds = chunkTargetSeconds(device, isNvidia)
         var want: Long = if (autoChunk) maxOf(1L shl 20, globalSize * 2) else CHUNK.toLong()
+        if (!autoChunk) RunStatus.noteGpuSetting("Seeds per launch", "%,d".format(want))
         if (autoChunk && !quiet) {
             println("${label}Chunk size: automatic, aiming for ${"%.1f".format(targetSeconds)} s per launch")
         }
@@ -1038,7 +1113,7 @@ object ClSearch {
 
             val tKernel = System.nanoTime()
             clEnqueueNDRangeKernel(queue, kernel, 1, null,
-                longArrayOf(globalSize), longArrayOf(LOCAL_SIZE), 0, null, null)
+                longArrayOf(globalSize), longArrayOf(localSize), 0, null, null)
             clFinish(queue)
             val kernelNs = System.nanoTime() - tKernel
             val tHost = System.nanoTime()
@@ -1116,6 +1191,7 @@ object ClSearch {
                 if (flagged > 0) next = minOf(next, (MAX_HITS / 4.0) * chunk / flagged)
                 next = next.coerceIn(maxOf(1L shl 16, globalSize).toDouble(), MAX_AUTO_CHUNK.toDouble())
                 want = (next.toLong() shr 16) shl 16     // a round multiple of 65,536
+                RunStatus.noteGpuSetting("Seeds per launch", "%,d".format(want) + " (auto)")
             }
 
             done += chunk

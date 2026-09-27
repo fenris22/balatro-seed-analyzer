@@ -578,7 +578,7 @@ fun main(args: Array<String>) {
         checkpointEvery = null,           // --checkpoint   (null = one tenth of the range)
         calibrationSeeds = 4_000_000L,    // --calibration-seeds
         globalSize = 4096,                // --global-size  (work items per compute unit)
-        localSize = 64,                   // --local-size
+        localSize = 0,                    // --local-size   (0 = automatic, per device)
         chunk = 0,                        // --chunk        (seeds per GPU launch; 0 = automatic)
     )
 

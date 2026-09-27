@@ -438,6 +438,7 @@ object WebServer {
             "logNext" to nextLog,
             "gpus" to gpuNames,
             "gpuError" to gpuError,
+            "gpuSettings" to s.gpuSettingsSnapshot(),
         )
     }
 
