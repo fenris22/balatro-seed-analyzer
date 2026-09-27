@@ -219,6 +219,41 @@ FORCE_INLINE double seed_prefix(const Rng *g, int keyLen) {
     return num;
 }
 
+#if EAGER_PREFIX
+// The key length each prefix slot stands for, so all of them can be hashed up front.
+__constant int SLOT_KEYLEN[MAX_LEN_SLOTS] = SLOT_KEYLEN_INIT;
+
+// Hashes the seed prefix for every slot, four slots at a time.
+//
+// Each prefix is a chain of dependent FP64 divisions, one per seed character, so a single
+// chain leaves the FP64 units waiting on the previous division. Four chains that do not
+// depend on each other give the scheduler something to issue in the meantime. The
+// arithmetic is exactly seed_prefix()'s, in the same order, so every value is bit-identical;
+// the cost is hashing slots a seed that dies early would never have needed.
+FORCE_INLINE void eager_prefixes(Rng *g, PREFIX_SPACE double *prefix) {
+    for (int s0 = 0; s0 < MAX_LEN_SLOTS; s0 += 4) {
+        const int has1 = s0 + 1 < MAX_LEN_SLOTS, has2 = s0 + 2 < MAX_LEN_SLOTS, has3 = s0 + 3 < MAX_LEN_SLOTS;
+        const int L0 = SLOT_KEYLEN[s0];
+        const int L1 = has1 ? SLOT_KEYLEN[s0 + 1] : 0;
+        const int L2 = has2 ? SLOT_KEYLEN[s0 + 2] : 0;
+        const int L3 = has3 ? SLOT_KEYLEN[s0 + 3] : 0;
+        double n0 = 1.0, n1 = 1.0, n2 = 1.0, n3 = 1.0;
+        for (int i = g->seedLen - 1; i >= 0; i--) {
+            const double c = (double)seed_char(g, i);
+            n0 = frac_d(PSEUDOHASH_K / n0 * c * PI_D + PI_D * (double)(L0 + i + 1));
+            if (has1) n1 = frac_d(PSEUDOHASH_K / n1 * c * PI_D + PI_D * (double)(L1 + i + 1));
+            if (has2) n2 = frac_d(PSEUDOHASH_K / n2 * c * PI_D + PI_D * (double)(L2 + i + 1));
+            if (has3) n3 = frac_d(PSEUDOHASH_K / n3 * c * PI_D + PI_D * (double)(L3 + i + 1));
+        }
+        prefix[s0] = n0;
+        if (has1) prefix[s0 + 1] = n1;
+        if (has2) prefix[s0 + 2] = n2;
+        if (has3) prefix[s0 + 3] = n3;
+    }
+    g->havePrefix = (MAX_LEN_SLOTS >= 32) ? 0xFFFFFFFFu : ((1u << MAX_LEN_SLOTS) - 1u);
+}
+#endif
+
 FORCE_INLINE int stream_id(int f, int s, int a, int r) {
     return ((f * SOURCE_COUNT + s) << 8) | (a << 4) | r;
 }
@@ -629,6 +664,9 @@ __kernel void search(
 
         g.havePrefix = 0u;
         g.hashedSeed = seed_prefix(&g, 0);   // identical to pseudohash(seed)
+#if EAGER_PREFIX
+        eager_prefixes(&g, prefix);
+#endif
 
 
         Match m;

@@ -185,6 +185,7 @@ fun runSearch(config: SearchConfig): List<SeedResult> {
     ClSearch.LOCAL_SIZE = opts.localSize.toLong()
     ClSearch.CHUNK = opts.chunk
     ClSearch.NV_MAX_REGISTERS = opts.nvRegisters
+    ClSearch.EAGER_PREFIX = opts.eagerPrefix
     ClSearch.PREFIX_CACHE = opts.prefixCache
     ClSearch.FORCE_INLINE_DEVICE_FUNCS = opts.forceInline
     val useGpu = opts.useGpu
@@ -200,8 +201,10 @@ fun runSearch(config: SearchConfig): List<SeedResult> {
             "(${"%,d".format(seedsToCount)}), max results $maxResults, " +
             (if (checkpointEvery > 0) "checkpoint every ${"%,d".format(checkpointEvery)}, " else "checkpoints off, ") +
             "calibration ${"%,d".format(calibrationSeeds)}, " +
-            (if (useGpu) "GPU global ${opts.globalSize}/CU, local ${opts.localSize}, chunk ${"%,d".format(opts.chunk)}" +
-                    (if (opts.nvRegisters > 0) ", nv registers ${opts.nvRegisters}" else "") +
+            (if (useGpu) "GPU global ${opts.globalSize}/CU, local ${opts.localSize}, chunk " +
+                    (if (opts.chunk <= 0) "auto" else "%,d".format(opts.chunk)) +
+                    (if (opts.nvRegisters >= 0) ", nv registers ${if (opts.nvRegisters == 0) "compiler's choice" else opts.nvRegisters}" else "") +
+                    (if (opts.eagerPrefix) ", eager prefix" else "") +
                     ", prefix cache ${opts.prefixCache}" + (if (!opts.forceInline) ", no forced inlining" else "")
             else "CPU only"))
     println("Skipping vouchers: ${ignoredVouchers.joinToString(", ").ifEmpty { "none" }}")

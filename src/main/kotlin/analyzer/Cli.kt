@@ -29,8 +29,10 @@ data class RunOptions(
     val port: Int = 7777,
     /** False with --no-browser: start the web page but do not open a browser. */
     val openBrowser: Boolean = true,
-    /** Nvidia register cap per thread; 0 leaves it to the compiler. */
-    val nvRegisters: Int = 0,
+    /** Nvidia register cap per thread; -1 works it out from the card, 0 leaves it to the compiler. */
+    val nvRegisters: Int = -1,
+    /** Compute all seed-prefix hashes up front, several at once. */
+    val eagerPrefix: Boolean = false,
     /** auto, local or private. */
     val prefixCache: String = "auto",
     val forceInline: Boolean = true,
@@ -82,9 +84,10 @@ object Cli {
         Flag("--global-size", "N", "GPU work items per compute unit (default ${d.globalSize}; " +
                 "power of 2 from 2048 to 16384 recommended)"),
         Flag("--local-size", "N", "GPU work-group size (default ${d.localSize}; power of 2 from 64 to 256 recommended)"),
-        Flag("--chunk", "N", "Seeds per GPU launch (default ${fmt(d.chunk.toLong())}; 2m to 64m recommended)"),
-        Flag("--nv-registers", "N", "Nvidia only: cap registers per thread so more threads fit (default 0 = " +
-                "compiler's choice; try 64, 80, 96, 128)"),
+        Flag("--chunk", "N", "Seeds per GPU launch (default ${if (d.chunk <= 0) "auto: sized to about a second per launch" else fmt(d.chunk.toLong())})"),
+        Flag("--nv-registers", "N", "Nvidia only: cap registers per thread so more threads fit (default auto: " +
+                "32 on H100/A100, 40 on RTX 30/40; 0 = compiler's choice)"),
+        Flag("--eager-prefix", null, "Hash every seed prefix up front, several at once (faster on some GPUs; benchmark it)"),
         Flag("--prefix-cache", "MODE", "Where the seed-prefix cache lives: auto, local (shared memory) or private " +
                 "(default auto: local on Nvidia, private elsewhere)"),
         Flag("--no-inline", null, "Let the GPU compiler decide what to inline instead of forcing it"),
@@ -158,6 +161,15 @@ object Cli {
 
     private fun isPow2(v: Long) = v > 0 && (v and (v - 1)) == 0L
 
+    /** "auto" (-1), 0 (compiler's choice), or a cap from 16 to 255. */
+    fun parseNvRegisters(raw: String): Int {
+        val v = raw.trim().lowercase()
+        if (v == "auto" || v.isEmpty()) return -1
+        val r = v.toIntOrNull() ?: throw CliError("--nv-registers must be auto, 0, or a number from 16 to 255")
+        if (r != 0 && r !in 16..255) throw CliError("--nv-registers must be auto, 0, or a number from 16 to 255")
+        return r
+    }
+
     /**
      * The --conditions value, found before the full parse: the file can carry settings of
      * its own, which become the defaults the other flags override.
@@ -197,6 +209,10 @@ object Cli {
                 if (eq >= 0) throw CliError("--no-browser takes no value")
                 o = o.copy(openBrowser = false); i++; continue
             }
+            if (name == "--eager-prefix") {
+                if (eq >= 0) throw CliError("--eager-prefix takes no value")
+                o = o.copy(eagerPrefix = true); i++; continue
+            }
             if (name == "--no-inline") {
                 if (eq >= 0) throw CliError("--no-inline takes no value")
                 o = o.copy(forceInline = false); i++; continue
@@ -214,7 +230,7 @@ object Cli {
                 "--calibration-seeds" -> o.copy(calibrationSeeds = parseCount(name, value))
                 "--global-size" -> o.copy(globalSize = toInt(name, value))
                 "--local-size" -> o.copy(localSize = toInt(name, value))
-                "--chunk" -> o.copy(chunk = toInt(name, value))
+                "--chunk" -> o.copy(chunk = if (value.trim().equals("auto", ignoreCase = true)) 0 else toInt(name, value))
                 "--examine" -> {
                     val seed = value.trim().uppercase()
                     if (seed.isEmpty() || seed.length > 8 || seed.any { it !in SEED_CHARS }) {
@@ -223,11 +239,7 @@ object Cli {
                     o.copy(examine = seed)
                 }
                 "--conditions" -> o.copy(conditionsFile = value)
-                "--nv-registers" -> {
-                    val r = toInt(name, value)
-                    if (r != 0 && r !in 16..255) throw CliError("--nv-registers must be 0 or between 16 and 255")
-                    o.copy(nvRegisters = r)
-                }
+                "--nv-registers" -> o.copy(nvRegisters = parseNvRegisters(value))
                 "--prefix-cache" -> {
                     val m = value.trim().lowercase()
                     if (m !in setOf("auto", "local", "private")) throw CliError("--prefix-cache must be auto, local or private")
@@ -273,7 +285,7 @@ object Cli {
         if (o.globalSize % o.localSize != 0) {
             throw CliError("--global-size ${o.globalSize} must be a multiple of --local-size ${o.localSize}")
         }
-        if (o.chunk < 1) throw CliError("--chunk must be at least 1")
+        if (o.chunk < 0) throw CliError("--chunk must be auto or a positive number")
 
         val out = ArrayList<String>()
         if (!isPow2(o.globalSize.toLong()) || o.globalSize !in 2048..16384) {
@@ -282,7 +294,7 @@ object Cli {
         if (!isPow2(o.localSize.toLong()) || o.localSize !in 64..256) {
             out.add("--local-size ${o.localSize} is outside the recommended range (a power of 2 from 64 to 256).")
         }
-        if (o.chunk !in 2_000_000..64_000_000) {
+        if (o.chunk > 0 && o.chunk !in 2_000_000..64_000_000) {
             out.add("--chunk ${"%,d".format(o.chunk)} is outside the recommended range (2m to 64m).")
         }
         return out

@@ -38,17 +38,26 @@ object ClSearch {
     var LOCAL_SIZE = 64L
 
     /**
-     * Seeds per kernel launch.
+     * Seeds per kernel launch, or 0 for automatic (the default).
      *
-     * Larger is better now that work is pulled from a shared counter rather than split by
-     * a fixed stride: a big chunk amortises the launch, the per-seed state clear and the
-     * host round-trip over more work, and there is no longer a ragged tail to pay for it.
-     * Lower this only if you are on a GPU driving a display, where a launch over about two
-     * seconds trips the watchdog and resets the driver.
+     * Automatic sizing measures each launch and aims for [CHUNK_TARGET_SECONDS] of kernel
+     * time: long enough that the gap between launches (buffer resets, reading hits, the CPU
+     * cross-check) is noise, short enough that progress, Stop and the multi-GPU tail stay
+     * responsive. On a GPU that may be driving a display it aims lower, because a launch
+     * over about two seconds trips the watchdog and resets the driver.
      *
      * Set from --chunk before a run; the default is in main().
      */
-    var CHUNK = 4_000_000
+    var CHUNK = 0
+
+    /** Kernel time automatic chunks aim for, per launch. */
+    const val CHUNK_TARGET_SECONDS = 1.0
+
+    /** The same, on a GPU that may have a display watchdog (Windows, or Nvidia reporting one). */
+    const val CHUNK_TARGET_SECONDS_WATCHDOG = 0.4
+
+    /** Automatic chunks never go above this: seed offsets within a launch are 32-bit. */
+    private const val MAX_AUTO_CHUNK = 1L shl 30
 
     /** Per-launch hit capacity. */
     const val MAX_HITS = 1 shl 18
@@ -86,7 +95,17 @@ object ClSearch {
      * the right value is empirical -- sweep 64, 72, 96, 128 and watch seeds/s. AMD is left
      * alone: CDNA occupancy is already good here and the flag is Nvidia-only anyway.
      */
-    var NV_MAX_REGISTERS = 0
+    var NV_MAX_REGISTERS = NV_REGISTERS_AUTO
+
+    /** NV_MAX_REGISTERS value meaning "work it out from the card" (see [nvidiaAutoRegisters]). */
+    const val NV_REGISTERS_AUTO = -1
+
+    /**
+     * Compute every seed-prefix hash at the start of each seed, several at once, instead of
+     * each one when a stream first needs it. See EAGER_PREFIX in search.cl. Set from
+     * --eager-prefix.
+     */
+    var EAGER_PREFIX = false
 
     /**
      * Force every device function inline.
@@ -326,6 +345,9 @@ object ClSearch {
         var lenSlotCount = 0
             private set
 
+        /** The key length each prefix slot stands for, in slot order. */
+        val slotKeyLens: List<Int> get() = keys.map { it.length }.distinct().sorted()
+
         val lenSlots: IntArray = run {
             val distinct = keys.map { it.length }.distinct().sorted()
             require(distinct.size <= MAX_LEN_SLOTS) {
@@ -389,6 +411,59 @@ object ClSearch {
      * which is why a kernel that behaves on a 64-CU consumer part can cap out VRAM and
      * crawl on a 304-CU accelerator.
      */
+    /**
+     * How long an automatic chunk should run. A GPU that drives a display has a watchdog
+     * that resets the driver if one launch runs for about two seconds: Nvidia reports it
+     * (CL_DEVICE_KERNEL_EXEC_TIMEOUT_NV), and on Windows every GPU has one (TDR). Those get
+     * a shorter target; a compute card with nothing attached gets the full second.
+     */
+    private fun chunkTargetSeconds(device: cl_device_id, isNvidia: Boolean): Double {
+        if (System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) return CHUNK_TARGET_SECONDS_WATCHDOG
+        if (isNvidia) {
+            try {
+                val v = IntArray(1)
+                clGetDeviceInfo(device, 0x4005, Sizeof.cl_int.toLong(), Pointer.to(v), null)
+                if (v[0] != 0) return CHUNK_TARGET_SECONDS_WATCHDOG
+            } catch (e: Exception) {
+                // Unknown: assume a compute card.
+            }
+        }
+        return CHUNK_TARGET_SECONDS
+    }
+
+    /**
+     * The register cap that lets an Nvidia SM hold its full complement of threads.
+     *
+     * This kernel is latency-bound: long chains of dependent FP64 divisions. Left alone the
+     * compiler gives it ~160 registers per thread, which leaves room for only 12 of an
+     * H100's 64 warps. Capping registers at 65,536 / (max threads per SM) fills the SM; the
+     * spills that costs mostly land in L1. Measured on an H100: 32 registers ran 1.8x faster
+     * than the default.
+     *
+     * The generation comes from the cl_nv_device_attribute_query extension. Returns the cap
+     * and a short reason for the log.
+     */
+    private fun nvidiaAutoRegisters(device: cl_device_id): Pair<Int, String> {
+        val major = IntArray(1)
+        val minor = IntArray(1)
+        try {
+            clGetDeviceInfo(device, 0x4000, Sizeof.cl_uint.toLong(), Pointer.to(major), null)
+            clGetDeviceInfo(device, 0x4001, Sizeof.cl_uint.toLong(), Pointer.to(minor), null)
+        } catch (e: Exception) {
+            return 40 to "compute capability unknown, 40 suits every recent card"
+        }
+        val cc = major[0] * 10 + minor[0]
+        val threads = when {
+            cc == 75 -> 1024                        // Turing
+            cc == 86 || cc == 89 -> 1536            // Ampere GeForce, Ada
+            major[0] >= 11 -> 1536                  // Blackwell GeForce / Thor
+            else -> 2048                            // Pascal, Volta, A100, H100, B200
+        }
+        val regs = (65536 / threads) / 8 * 8
+        return regs to "compute capability ${major[0]}.${minor[0]}, $threads threads per SM; " +
+                "--nv-registers overrides"
+    }
+
     /**
      * Registers per thread and spills, from the -cl-nv-verbose build log, plus how many
      * warps that lets each SM hold. This kernel is latency-bound -- long chains of dependent
@@ -552,6 +627,8 @@ object ClSearch {
         // The real count, not the ceiling: this sizes a dynamically indexed private array,
         // so every unused slot is scratch reserved for every resident work item.
         d("MAX_LEN_SLOTS", streams.lenSlotCount)
+        d("EAGER_PREFIX", if (EAGER_PREFIX) 1 else 0)
+        d("SLOT_KEYLEN_INIT", streams.slotKeyLens.joinToString(",", "{", "}"))
         d("WG_SIZE", LOCAL_SIZE)
         // Shared memory for the prefix cache only where there is enough of it. An H100 SM
         // has 228 KB and hosts several groups happily; a CDNA3 compute unit has 64 KB
@@ -642,7 +719,7 @@ object ClSearch {
      * hours after everything else. Pulling blocks on demand means a slow device simply
      * takes fewer of them, and no estimate is needed.
      */
-    class SeedDispenser(private val start: Long, val total: Long, private val block: Long = CHUNK.toLong()) {
+    class SeedDispenser(private val start: Long, val total: Long) {
         private val next = java.util.concurrent.atomic.AtomicLong(start)
         private val finished = java.util.concurrent.atomic.AtomicLong()
         private val end = start + total
@@ -655,15 +732,19 @@ object ClSearch {
          */
         private val inFlight = java.util.concurrent.ConcurrentSkipListSet<Long>()
 
-        /** Base index of the next block, or -1 when the range is exhausted. */
-        fun take(): Long {
-            val b = next.getAndAdd(block)
+        /**
+         * Base index of the next block of up to [want] seeds, or -1 when the range is
+         * exhausted. Each device asks for its own size, so a fast card takes bigger blocks.
+         */
+        fun take(want: Long): Long {
+            val b = next.getAndAdd(want)
             if (b >= end) return -1L
             inFlight.add(b)
             return b
         }
 
-        fun sizeOf(base: Long): Int = minOf(block, end - base).toInt()
+        /** Seeds in the block starting at [base] that was taken with [want]. */
+        fun sizeOf(base: Long, want: Long): Int = minOf(want, end - base).toInt()
 
         /** Records a finished block and returns the running total across all devices. */
         fun complete(base: Long, n: Int): Long {
@@ -854,9 +935,14 @@ object ClSearch {
         val source = buildDefines(conditions, detail, maxSearchAnte, shopItems, streams, useLocalPrefix,
             stages, globalSize) +
                 "\n" + loadSource()
+        val nvRegs = if (!isNvidia) 0 else if (NV_MAX_REGISTERS == NV_REGISTERS_AUTO) {
+            nvidiaAutoRegisters(device).also { (regs, why) ->
+                if (!quiet) println("${label}Register cap: $regs per thread ($why)")
+            }.first
+        } else NV_MAX_REGISTERS
         val buildOptions = buildString {
             append(BUILD_OPTIONS)
-            if (isNvidia && NV_MAX_REGISTERS > 0) append(" -cl-nv-maxrregcount=$NV_MAX_REGISTERS")
+            if (isNvidia && nvRegs > 0) append(" -cl-nv-maxrregcount=$nvRegs")
             // Makes Nvidia's compiler report registers and spills in the build log, which is
             // the number that decides how many threads fit on each SM.
             if (isNvidia && !quiet) append(" -cl-nv-verbose")
@@ -917,12 +1003,23 @@ object ClSearch {
 
         val work = dispenser ?: SeedDispenser(startIndex, seedCount)
 
+        // Chunk sizing: fixed when --chunk is given, otherwise measured. The first launch
+        // is small (a couple of seeds per work item) and each one after is sized from the
+        // speed of the last, growing at most 4x a step so a slow warm-up launch cannot
+        // overshoot.
+        val autoChunk = CHUNK <= 0
+        val targetSeconds = chunkTargetSeconds(device, isNvidia)
+        var want: Long = if (autoChunk) maxOf(1L shl 20, globalSize * 2) else CHUNK.toLong()
+        if (autoChunk && !quiet) {
+            println("${label}Chunk size: automatic, aiming for ${"%.1f".format(targetSeconds)} s per launch")
+        }
+
         while (true) {
             // Checked once per chunk: a volatile read, nothing on the device's path.
             if (SearchControl.stopRequested) break
-            val base = work.take()
+            val base = work.take(want)
             if (base < 0) break
-            val chunk = work.sizeOf(base)
+            val chunk = work.sizeOf(base, want)
 
             clEnqueueWriteBuffer(queue, bHitCount, CL_TRUE, 0, (2 * Sizeof.cl_int).toLong(),
                 Pointer.to(intArrayOf(0, 0)), 0, null, null)
@@ -1007,6 +1104,18 @@ object ClSearch {
                     Pointer.to(overflowIdx), 0, null, null)
                 for (i in 0 until nOver) punts.submit(base + overflowIdx[i])
                 totalOverflow += nOver
+            }
+
+            if (autoChunk && chunk >= want / 2 && kernelNs > 0) {
+                val rate = chunk * 1e9 / kernelNs
+                var next = rate * targetSeconds
+                next = minOf(next, want * 4.0)
+                // Keep a launch's hits and punts well inside their buffers: at a high hit
+                // rate a long launch would overflow them.
+                val flagged = counts[0].toLong() + counts[1].toLong()
+                if (flagged > 0) next = minOf(next, (MAX_HITS / 4.0) * chunk / flagged)
+                next = next.coerceIn(maxOf(1L shl 16, globalSize).toDouble(), MAX_AUTO_CHUNK.toDouble())
+                want = (next.toLong() shr 16) shl 16     // a round multiple of 65,536
             }
 
             done += chunk
@@ -1167,7 +1276,8 @@ object ClSearch {
             return
         }
 
-        println("Using ${found.size} GPUs, pulling ${"%,d".format(CHUNK)}-seed blocks on demand:")
+        println("Using ${found.size} GPUs, each pulling " +
+                (if (CHUNK > 0) "${"%,d".format(CHUNK)}-seed" else "its own size of") + " blocks on demand:")
         found.forEachIndexed { i, d ->
             println("  [gpu$i] ${deviceInfo(d.second, CL_DEVICE_NAME).trim()} (${readComputeUnits(d.second)} CUs)")
         }

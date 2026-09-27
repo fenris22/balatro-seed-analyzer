@@ -579,7 +579,7 @@ fun main(args: Array<String>) {
         calibrationSeeds = 4_000_000L,    // --calibration-seeds
         globalSize = 4096,                // --global-size  (work items per compute unit)
         localSize = 64,                   // --local-size
-        chunk = 4_000_000,                // --chunk        (seeds per GPU launch)
+        chunk = 0,                        // --chunk        (seeds per GPU launch; 0 = automatic)
     )
 
     val file: ConditionFile?

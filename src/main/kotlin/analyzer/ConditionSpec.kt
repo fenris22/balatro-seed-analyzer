@@ -226,11 +226,17 @@ fun applySettings(base: RunOptions, raw: Any?, validate: Boolean = true): RunOpt
     count("calibrationSeeds", "--calibration-seeds")?.let { o = o.copy(calibrationSeeds = it) }
     int("globalSize", "--global-size")?.let { o = o.copy(globalSize = it) }
     int("localSize", "--local-size")?.let { o = o.copy(localSize = it) }
-    int("chunk", "--chunk")?.let { o = o.copy(chunk = it) }
-    int("nvRegisters", "--nv-registers")?.let {
-        if (it != 0 && it !in 16..255) throw SpecError("--nv-registers must be 0 or between 16 and 255")
-        o = o.copy(nvRegisters = it)
+    if (s["chunk"]?.toString()?.trim()?.equals("auto", ignoreCase = true) == true) o = o.copy(chunk = 0)
+    else int("chunk", "--chunk")?.let { o = o.copy(chunk = it) }
+    s["nvRegisters"]?.let { v ->
+        val text = if (v is Number) v.toLong().toString() else v.toString()
+        try {
+            o = o.copy(nvRegisters = Cli.parseNvRegisters(text))
+        } catch (e: CliError) {
+            throw SpecError(e.message ?: "bad --nv-registers")
+        }
     }
+    (s["eagerPrefix"] as? Boolean)?.let { o = o.copy(eagerPrefix = it) }
     (s["prefixCache"] as? String)?.lowercase()?.takeIf { it.isNotBlank() }?.let {
         if (it !in setOf("auto", "local", "private")) throw SpecError("prefix cache must be auto, local or private")
         o = o.copy(prefixCache = it)
@@ -255,8 +261,9 @@ fun settingsToJson(o: RunOptions): Map<String, Any?> = mapOf(
     "calibrationSeeds" to o.calibrationSeeds,
     "globalSize" to o.globalSize,
     "localSize" to o.localSize,
-    "chunk" to o.chunk,
-    "nvRegisters" to o.nvRegisters,
+    "chunk" to if (o.chunk <= 0) "auto" else o.chunk,
+    "nvRegisters" to if (o.nvRegisters < 0) "auto" else o.nvRegisters,
+    "eagerPrefix" to o.eagerPrefix,
     "prefixCache" to o.prefixCache,
     "forceInline" to o.forceInline,
 )
