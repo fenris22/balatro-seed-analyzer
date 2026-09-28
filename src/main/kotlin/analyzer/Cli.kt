@@ -100,7 +100,7 @@ object Cli {
         Flag("--local-size", "N", "GPU work-group size (default ${if (d.localSize <= 0) "auto: the largest up to 256 the device and kernel allow" else d.localSize.toString()})"),
         Flag("--chunk", "N", "Seeds per GPU launch (default ${if (d.chunk <= 0) "auto: sized to about a second per launch" else fmt(d.chunk.toLong())})"),
         Flag("--nv-registers", "N", "Nvidia only: cap registers per thread so more threads fit (default auto: " +
-                "32 on H100/A100, 40 on RTX 30/40; 0 = compiler's choice)"),
+                "the register file divided by the most threads an SM can hold; 0 = compiler's choice)"),
         Flag("--eager-prefix", null, "Hash every seed prefix up front, several at once (faster on some GPUs; benchmark it)"),
         Flag("--prefix-cache", "MODE", "Where the seed-prefix cache lives: auto, local (shared memory) or private " +
                 "(default auto: local only if it fits without shrinking the work-group size)"),
@@ -111,15 +111,15 @@ object Cli {
         Flag("--split-packs", "MODE", "auto, on or off: in the prefilter checks, roll an ante's pack kinds " +
                 "first and deal its cards one pack family at a time, so GPU lanes stay in step (default auto: on)"),
         Flag("--stage-major", "MODE", "auto, on or off: run the first quick check over a batch of seeds " +
-                "one kind of work at a time, so GPU lanes stay busy (pack-joker checks, with --two-round; default auto: on)"),
+                "one kind of work at a time, so GPU lanes stay busy (needs --two-round; default auto: on)"),
         Flag("--split-rounds", "MODE", "auto, on or off: build the stage-major first check and the rest of the " +
                 "search as two GPU programs, each with its own register budget (default auto: on with --stage-major)"),
         Flag("--nv-registers-r1", "N", "NVIDIA: register cap for the stage-major first check when the rounds are " +
                 "split: auto, 0 (compiler's choice) or a number (default auto: twice the full-occupancy cap, or the " +
                 "full-occupancy cap when the first check has Arcana, Spectral or Soul work)"),
         Flag("--rng-table", "BITS", "auto, off, 4, 8 or 16: replace the random generator's 44 dependent steps " +
-                "with table lookups (4: 8 KB in shared memory, 8: 64 KB, 16: 8 MB). Default auto: 4 when the first " +
-                "quick check has more than Buffoon jokers (Souls, tarots, planets, spectrals, vouchers), otherwise off"),
+                "with table lookups (4: 8 KB in shared memory, 8: 64 KB, 16: 8 MB). Default auto: when the first quick " +
+                "check has more than Buffoon jokers, the first chunks try off and 4 and keep the faster; otherwise off"),
         Flag("--no-inline", null, "Let the GPU compiler decide what to inline instead of forcing it"),
         Flag("--examine", "SEED", "Print antes 1-8 of one seed in full and exit, without searching"),
         Flag("--conditions", "FILE", "Search the conditions in FILE (saved from the web page) without the " +
