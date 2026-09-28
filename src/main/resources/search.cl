@@ -398,6 +398,61 @@ FORCE_INLINE double rnd_reg(Rng *g,
     return LUA_DRAW(g, (advanced + g->hashedSeed) / 2.0);
 }
 
+#if STAGE_MAJOR
+// Stage-major helpers (see the stage-major block in the kernel). A stream there lives in a
+// register for the whole of one phase, so there is no state buffer and no tag: these are
+// seed_prefix(), init_stream() and rnd() for a seed whose data sits in the group's scratch,
+// with the same arithmetic in the same order.
+FORCE_INLINE double sm_seed_prefix(ulong lo, ulong hi, int len, int keyLen) {
+    double num = 1.0;
+    for (int i = len - 1; i >= 0; i--) {
+        const uint ch = (uint)((i < 8 ? (lo >> (8 * i)) : (hi >> (8 * (i - 8)))) & 0xFFUL);
+        num = frac_d(PSEUDOHASH_K / num * (double)ch * PI_D + PI_D * (double)(keyLen + i + 1));
+    }
+    return num;
+}
+
+// Slot (1-based place in its pack) of the j-th card of family fam among an ante's packs,
+// skipping `first` cards of each pack (Telescope's forced Celestial card).
+FORCE_INLINE int sm_slot(uint kinds, int ante, int fam, int first, int j,
+                         __constant const int *packFamily, __constant const int *packSize) {
+    const int packs = (ante == 1) ? 4 : 6;
+    for (int p = 0; p < packs; p++) {
+        const int kind = (int)((kinds >> (4 * p)) & 0xFu);
+        if (packFamily[kind] != fam) continue;
+        const int n = max(packSize[kind] - first, 0);
+        if (j < n) return j + first + 1;
+        j -= n;
+    }
+    return 0;
+}
+
+// First-touch value of stream cid for seed s; the seed prefix is cached per key length.
+FORCE_INLINE double sm_stream(uint s, int cid,
+                              __global const ulong *sLo, __global const ulong *sHi, __global const uint *sLen,
+                              __global double *sPre, __global uint *sHave,
+                              __constant const uchar *keyChars, __constant const uchar *keyLens,
+                              __constant const uchar *keySlots)
+{
+    const int keyLen = keyLens[cid];
+    const int slot = keySlots[cid];
+    double num;
+    const uint have = sHave[s];
+    if ((have >> slot) & 1u) {
+        num = sPre[(size_t)s * MAX_LEN_SLOTS + slot];
+    } else {
+        num = sm_seed_prefix(sLo[s], sHi[s], (int)sLen[s], keyLen);
+        sPre[(size_t)s * MAX_LEN_SLOTS + slot] = num;
+        sHave[s] = have | (1u << slot);
+    }
+    __constant const uchar *k = keyChars + (size_t)cid * MAX_KEY_LEN;
+    for (int i = keyLen - 1; i >= 0; i--) {
+        num = frac_d(PSEUDOHASH_K / num * (double)k[i] * PI_D + PI_D * (double)(i + 1));
+    }
+    return num;
+}
+#endif
+
 #define RND(f, s, a, r) rnd(&g, prefix, keyChars, keyLens, keySlots, (f), (s), (a), (r))
 #define RNDR(cid, stp)  rnd_reg(&g, prefix, keyChars, keyLens, keySlots, (cid), (stp))
 
@@ -676,6 +731,110 @@ FORCE_INLINE double best_per_match_from(__constant const int *anteMin, __constan
 #ifndef SPLIT_PACKS
 #define SPLIT_PACKS 0
 #endif
+#ifndef STAGE_MAJOR
+#define STAGE_MAJOR 0
+#endif
+
+// Split rounds: the same source built twice. ROUND_KERNEL 1 is only the stage-major round
+// and hands its survivors to smQueue; ROUND_KERNEL 2 is only the ordinary per-seed code,
+// run over smQueue from the second pass on. Each build keeps just its own code, so each gets
+// its own register allocation (and its own Nvidia register cap). 0 is the single kernel.
+#ifndef ROUND_KERNEL
+#define ROUND_KERNEL 0
+#endif
+#if ROUND_KERNEL == 1 && !(STAGE_MAJOR && COMPACT)
+#error "round 1 is the stage-major round"
+#endif
+#if ROUND_KERNEL == 2 && (COMPACT || STAGE_MAJOR)
+#error "round 2 is the ordinary per-seed code"
+#endif
+#if ROUND_KERNEL == 1
+#define SM_PUSH(x_) (smQueue[atomic_inc(smQueueN)] = (x_))
+#else
+#define SM_PUSH(x_) (lQueue[atomic_inc(&lQn)] = (x_))
+#endif
+#if STAGE_MAJOR && !(COMPACT && STATE_TAGS && NUM_STAGES > 0)
+#error "stage-major needs the two-round scan, stream tags and a prefilter stage"
+#endif
+
+// Stage-major seed flags, above the unmet count in sSt.
+#define SM_GENFIRST (1u << 8)   // the forced first Buffoon pack has been dealt
+#define SM_OVERFLOW (1u << 9)   // a stream the table does not have: undecided, the next pass decides
+
+// One draw on a register stream, exactly as rnd() does it.
+#define SM_DRAW(st_, hs_, out_)                                                    \
+    do {                                                                           \
+        const double _adv = round13(frac_d((st_) * 1.72431234 + 2.134453429141));  \
+        (st_) = _adv;                                                              \
+        (out_) = LUA_DRAW(&g, (_adv + (hs_)) / 2.0);                               \
+    } while (0)
+
+// Lane context: one seed's generator state loaded into this lane's Rng, so the ordinary
+// per-card code (RND, OFFER, SOUL_FOUND, SPECTRAL_SLOT) runs on it unchanged. Each phase
+// starts its streams fresh (tags cleared): within an ante, no two phases share a stream.
+#define SM_CTX_IN(s_)                                                              \
+    do {                                                                           \
+        g.seedLo = sLo[s_]; g.seedHi = sHi[s_]; g.seedLen = (int)sLen[s_];         \
+        g.hashedSeed = sHs[s_];                                                    \
+        g.havePrefix = sHave[s_];                                                  \
+        for (int _k = 0; _k < MAX_LEN_SLOTS; _k++)                                 \
+            if ((g.havePrefix >> _k) & 1u) prefix[_k] = sPre[(size_t)(s_) * MAX_LEN_SLOTS + _k]; \
+        g.overflow = 0;                                                            \
+        g.anteBase = anteEnd[ante - 1];                                            \
+        g.anteLen = anteEnd[ante] - g.anteBase;                                    \
+        g.tagAnte = 0UL;                                                           \
+        g.runBase = anteEnd[MAX_SEARCH_ANTE];                                      \
+        g.tagRun = 0UL;                                                            \
+    } while (0)
+// ...and back: the prefixes hashed meanwhile.
+#define SM_CTX_OUT(s_, have0_)                                                     \
+    do {                                                                           \
+        const uint _new = g.havePrefix & ~(have0_);                                \
+        for (int _k = 0; _k < MAX_LEN_SLOTS; _k++)                                 \
+            if ((_new >> _k) & 1u) sPre[(size_t)(s_) * MAX_LEN_SLOTS + _k] = prefix[_k]; \
+        sHave[s_] = g.havePrefix;                                                  \
+    } while (0)
+// One seed's run-long streams (no ante of their own), into this lane's state slots and back.
+#define SM_RUN_IN(s_)                                                              \
+    do {                                                                           \
+        g.tagRun = sRunTag[s_];                                                    \
+        for (int _k = 0; _k < SM_RUN_N; _k++)                                      \
+            if ((g.tagRun >> _k) & 1UL)                                            \
+                g.state[(size_t)(g.runBase + _k) * g.gsize + g.gid] = sRun[(size_t)(s_) * SM_RUN_N + _k]; \
+    } while (0)
+#define SM_RUN_OUT(s_)                                                             \
+    do {                                                                           \
+        for (int _k = 0; _k < SM_RUN_N; _k++)                                      \
+            if ((g.tagRun >> _k) & 1UL)                                            \
+                sRun[(size_t)(s_) * SM_RUN_N + _k] = g.state[(size_t)(g.runBase + _k) * g.gsize + g.gid]; \
+        sRunTag[s_] = g.tagRun;                                                    \
+    } while (0)
+// One seed's condition counts, into a local Match and back.
+#define SM_MATCH_IN(s_)                                                            \
+    do {                                                                           \
+        m.found = sFound[s_]; m.unmet = (int)(sSt[s_] & 0xFFu); m.dead = 0; m.total = 0.0; \
+    } while (0)
+#define SM_MATCH_OUT(s_)                                                           \
+    do {                                                                           \
+        sFound[s_] = m.found; sSt[s_] = (sSt[s_] & ~0xFFu) | (uint)m.unmet;        \
+    } while (0)
+
+// Counting sort of chains 0..C_-1 into smOrder, largest key first. keyexpr_ uses c_.
+#define SM_SORT(C_, keyexpr_)                                                      \
+    do {                                                                           \
+        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);                       \
+        if (lid < 32) smHist[lid] = 0u;                                            \
+        barrier(CLK_LOCAL_MEM_FENCE);                                              \
+        for (uint c_ = lid; c_ < (C_); c_ += lsz) atomic_inc(&smHist[min((uint)(keyexpr_), 31u)]); \
+        barrier(CLK_LOCAL_MEM_FENCE);                                              \
+        if (lid == 0) {                                                            \
+            uint _run = 0u;                                                        \
+            for (int _k = 31; _k >= 0; _k--) { const uint _h = smHist[_k]; smHist[_k] = _run; _run += _h; } \
+        }                                                                          \
+        barrier(CLK_LOCAL_MEM_FENCE);                                              \
+        for (uint c_ = lid; c_ < (C_); c_ += lsz) smOrder[atomic_inc(&smHist[min((uint)(keyexpr_), 31u)])] = (ushort)c_; \
+        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);                       \
+    } while (0)
 #if NUM_PACK_KINDS > 16
 #error "pack kinds are packed 4 bits each"
 #endif
@@ -709,6 +868,9 @@ __kernel void search(
     __global const int      *remap,
     __constant const int    *anteEnd,        // one past the last stream of each ante
     __global const ulong    *rngTable,       // leap-ahead table; a placeholder when RNG_TABLE_BITS is 0
+    __global uchar          *smScratch,      // stage-major scratch; a placeholder when STAGE_MAJOR is 0
+    __global uint           *smQueue,        // split rounds: seeds round 1 hands to round 2
+    __global uint           *smQueueN,       // split rounds: how many
     __global double         *state,
     __global int            *hitIndex,         // seed offsets within this chunk
     __global double         *hitScore,
@@ -774,6 +936,53 @@ __kernel void search(
     if (lid == 0) lQn = 0u;
 #endif
 
+#if STAGE_MAJOR
+    // This group's slice of the stage-major scratch: GRAB_SIZE seeds, SM_SEED_BYTES each.
+    // Per seed: its characters, hashes, cached prefixes, condition counts and flags; per
+    // (seed, ante) with Buffoon cards ("chain"): its card count, rarities and editions.
+    __global uchar *smBase = smScratch + (size_t)get_group_id(0) * ((size_t)GRAB_SIZE * SM_SEED_BYTES);
+    __global ulong *sLo = (__global ulong *)smBase;
+    __global ulong *sHi = sLo + GRAB_SIZE;
+    __global ulong *sFound = sHi + GRAB_SIZE;      // Match.found
+    __global ulong *cRar = sFound + GRAB_SIZE;     // 2 bits of rarity per card
+    __global ulong *cEd0 = cRar + GRAB_SIZE;       // 4 bits of edition per card, cards 0-15
+    __global ulong *sVouch = cEd0 + GRAB_SIZE;     // vouchers held (stages that track them)
+    __global ulong *sRunTag = sVouch + GRAB_SIZE;  // which run-long streams exist
+    __global double *sHs = (__global double *)(sRunTag + GRAB_SIZE);
+    __global double *sPre = sHs + GRAB_SIZE;       // [seed * MAX_LEN_SLOTS + slot]
+    __global double *sRun = sPre + (size_t)GRAB_SIZE * MAX_LEN_SLOTS;   // [seed * SM_RUN_N + k]
+    __global uint *sHave = (__global uint *)(sRun + (size_t)GRAB_SIZE * SM_RUN_N);
+    __global uint *sLen = sHave + GRAB_SIZE;
+    __global uint *sSt = sLen + GRAB_SIZE;         // unmet in bits 0-7, then SM_* flags
+    __global uint *cCnt = sSt + GRAB_SIZE;         // cards per rarity, 8 bits each
+    __global uint *cEd1 = cCnt + GRAB_SIZE;        // editions, cards 16-23
+    __global uint *cN = cEd1 + GRAB_SIZE;
+    __global uint *sLeg = cN + GRAB_SIZE;          // legendaries handed out so far
+    __global uint *sSoul = sLeg + GRAB_SIZE;       // Souls found so far
+    __global uint *sKinds = sSoul + GRAB_SIZE;     // this ante's pack kinds, 4 bits each
+    __global uint *aN = sKinds + GRAB_SIZE;        // Arcana/Spectral cards per seed
+    __global uint *pN = aN + GRAB_SIZE;            // Celestial cards per seed
+    __global uint *tN = pN + GRAB_SIZE;            // Arcana cards per seed (no Omen Globe)
+    __global uint *qN = tN + GRAB_SIZE;            // Spectral pack cards per seed (no Omen Globe)
+    __global uint *sTSoul = qN + GRAB_SIZE;        // which Arcana cards are Souls, this ante
+    __global uint *sQSoul = sTSoul + GRAB_SIZE;    // which Spectral pack cards are Souls
+    __global uint *sQRet = sQSoul + GRAB_SIZE;     // Spectral pack cards still to draw
+    __global uint *sCBH = sQRet + GRAB_SIZE;       // which Celestial cards are Black Holes
+    __global ushort *smLive0 = (__global ushort *)(sCBH + GRAB_SIZE);
+    __global ushort *smLive1 = smLive0 + GRAB_SIZE;
+    __global ushort *cSeed = smLive1 + GRAB_SIZE;
+    __global ushort *aSeed = cSeed + GRAB_SIZE;
+    __global ushort *pSeed = aSeed + GRAB_SIZE;
+    __global ushort *tSeed = pSeed + GRAB_SIZE;
+    __global ushort *qSeed = tSeed + GRAB_SIZE;
+
+    __local ushort smOrder[GRAB_SIZE];
+    __local uint smHist[32];
+    __local uint smLive, smNext, smChains, smCel, smArc, smCT, smCQ, smAny;
+#else
+    (void)smScratch;
+#endif
+
 #if USE_LOCAL_PREFIX
     __local double prefixPool[WG_SIZE * PREFIX_STRIDE];
     __local double *prefix = prefixPool + lid * PREFIX_STRIDE;
@@ -783,18 +992,594 @@ __kernel void search(
 
     for (;;) {
         barrier(CLK_LOCAL_MEM_FENCE);
+#if ROUND_KERNEL == 1
+        // Stop taking seeds once the queue for round 2 is nearly full: the host runs round 2
+        // on it and starts this round again where it left off.
+        if (lid == 0) lBase = (atomic_add(smQueueN, 0u) >= (uint)SM_QCAP) ? 0xFFFFFFFFu : atomic_add(workCounter, grabPerGroup);
+#else
         if (lid == 0) lBase = atomic_add(workCounter, grabPerGroup);
+#endif
         barrier(CLK_LOCAL_MEM_FENCE);
 
         const uint grabbed = lBase;
 #if COMPACT
         const int drain = grabbed >= (uint)chunkSize;
+#if ROUND_KERNEL == 1
+        if (drain) break;               // nothing is left in this kernel's queue to drain
+#endif
         const uint grabEnd = drain ? grabbed : min(grabbed + grabPerGroup, (uint)chunkSize);
         uint queued = 0u;
-      for (int phase = 0; phase < 2; phase++) {
+      for (int phase = 0; phase < ((ROUND_KERNEL == 1) ? 1 : 2); phase++) {
         uint phaseN;
         if (phase == 0) {
+#if STAGE_MAJOR
+            /*
+             * Round 1, stage-major: the first prefilter stage (pack jokers) for the whole grab
+             * at once, one kind of work at a time, instead of each lane walking its own seed.
+             *
+             * Per ante: every live seed rolls its pack kinds; every (seed, ante) with Buffoon
+             * cards draws its rarities and editions; then, one rarity at a time, the jokers of
+             * that rarity. Before each phase the entries are sorted by how many cards they
+             * have, so the lanes of a wave get the same amount of work and set up the same
+             * stream at the same time. After each ante every live seed takes the ordinary
+             * end-of-ante decision (CLOSE_ANTE, all conditions met, last ante); the decided
+             * ones go to the queue for round 2 and the killed ones are dropped.
+             *
+             * Each stream sees the draws of the ordinary stage in the same order, and a stage
+             * decides only from counts at the end of an ante, so the order in which cards are
+             * offered to the conditions does not matter.
+             */
+            {
+                const uint n = grabEnd - grabbed;
+                const uint passMask = STAGE_MASK[0];
+                const int passFlags = STAGE_FLAGS[0];
+                const int lastAnte = STAGE_MAX_ANTE[0];
+
+                // Without planets, Celestial cards matter only if some condition takes a
+                // Black Hole (as in split packs).
+                int wantCel = 0;
+#if WANT_PLANETS
+                if (passFlags & ST_PLANETS) wantCel = 1;
+#endif
+#if WANT_SOULS
+                if (!wantCel && (passFlags & ST_SOULS)) {
+                    for (int i = 0; i < NUM_CONDS && !wantCel; i++) {
+                        if (!((passMask >> i) & 1u)) continue;
+                        for (int k = 0; k < condItemCnt[i]; k++) {
+                            if (condItems[condItemOfs[i] + k] == CODE_BLACK_HOLE) { wantCel = 1; break; }
+                        }
+                    }
+                }
+#endif
+
+                for (uint s = lid; s < n; s += lsz) {
+                    ulong lo, hi;
+                    const int len = seed_for_index(baseIndex + (ulong)(grabbed + s), &lo, &hi);
+                    sLo[s] = lo; sHi[s] = hi; sLen[s] = (uint)len;
+                    sHs[s] = sm_seed_prefix(lo, hi, len, 0);     // pseudohash(seed)
+                    sHave[s] = 0u;
+                    sFound[s] = 0UL;
+                    sSt[s] = (uint)popcount(passMask);
+                    sVouch[s] = 0UL;
+                    sRunTag[s] = 0UL;
+                    sLeg[s] = 0u;
+                    sSoul[s] = 0u;
+                    smLive0[s] = (ushort)s;
+                }
+                if (lid == 0) smLive = n;
+                barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+                __global ushort *live = smLive0, *nextLive = smLive1;
+                for (int ante = 1; ante <= lastAnte; ante++) {
+                    const uint L = smLive;
+                    if (L == 0u) break;
+                    barrier(CLK_LOCAL_MEM_FENCE);
+                    if (lid == 0) { smChains = 0u; smCel = 0u; smArc = 0u; smCT = 0u; smCQ = 0u; smNext = 0u; }
+                    barrier(CLK_LOCAL_MEM_FENCE);
+
+                    // ---- per live seed: the voucher, then the pack kinds (lane context) ----
+                    for (uint i = lid; i < L; i += lsz) {
+                        const uint s = live[i];
+                        SM_CTX_IN(s);
+                        const uint have0 = g.havePrefix;
+                        uint st = sSt[s];
+                        ulong va = sVouch[s];
+                        if (passFlags & ST_VOUCHERS) {
+                            // As the ordinary stage does: a reroll while the voucher is taken
+                            // or its base voucher is not.
+                            int vIdx = rnd_index(RND(F_VOUCHER, 0, ante, 0), NUM_VOUCHERS);
+                            int resample = 0;
+                            while (((vIdx & 1) && !((va >> (vIdx - 1)) & 1UL)) || ((va >> vIdx) & 1UL)) {
+                                resample++;
+                                if (resample >= MAX_RESAMPLE) { g.overflow = 1; break; }
+                                vIdx = rnd_index(RND(F_VOUCHER, 0, ante, resample), NUM_VOUCHERS);
+                            }
+                            if (!g.overflow && !voucherIgnored[vIdx]) {
+                                va |= (1UL << vIdx);
+                                if (vIdx & 1) va |= (1UL << (vIdx - 1));
+                            }
+                        }
+                        const int omen = (int)((va >> V_OMEN_GLOBE) & 1UL);
+                        const int tel = (int)((va >> V_TELESCOPE) & 1UL);
+                        const int arcOn = (passFlags & (ST_TAROTS | ST_SOULS)) || ((passFlags & ST_SPECTRALS) && omen);
+                        const int speOn = (passFlags & (ST_SOULS | ST_SPECTRALS)) != 0;
+                        const int packs = (ante == 1) ? 4 : 6;
+                        uint kinds = 0u;
+                        int bufC = 0, celC = 0, tC = 0, qC = 0;
+                        for (int p = 0; p < packs && !g.overflow; p++) {
+                            int kind;
+                            if (ante <= 2 && !(st & SM_GENFIRST)) {
+                                st |= SM_GENFIRST;
+                                kind = BUFFOON_PACK_INDEX;
+                            } else {
+                                const double poll = RND(F_SHOP_PACK, 0, ante, 0) * PACK_TOTAL_WEIGHT;
+                                kind = NUM_PACK_KINDS - 1;
+                                for (int k = 0; k < NUM_PACK_KINDS; k++) {
+                                    if (packCum[k] >= poll) { kind = k; break; }
+                                }
+                            }
+                            kinds |= (uint)kind << (4 * p);
+                            const int fm = packFamily[kind];
+                            if (fm == PACK_BUFFOON) bufC += packSize[kind];
+                            else if (fm == PACK_CELESTIAL) celC += max(packSize[kind] - tel, 0);
+                            else if (fm == PACK_ARCANA && arcOn) tC += packSize[kind];
+                            else if (fm == PACK_SPECTRAL && speOn) qC += packSize[kind];
+                        }
+                        if (g.overflow) st |= SM_OVERFLOW;
+                        SM_CTX_OUT(s, have0);
+                        sSt[s] = st;
+                        sVouch[s] = va;
+                        sKinds[s] = kinds;
+                        sTSoul[s] = 0u; sQSoul[s] = 0u; sQRet[s] = 0u; sCBH[s] = 0u;
+                        if (!(st & SM_OVERFLOW)) {
+                            if (bufC > 0 && (passFlags & ST_JOKERS)) {
+                                const uint c = atomic_inc(&smChains);
+                                cSeed[c] = (ushort)s; cN[c] = (uint)bufC;
+                            }
+                            if (celC > 0 && wantCel) {
+                                const uint c = atomic_inc(&smCel);
+                                pSeed[c] = (ushort)s; pN[c] = (uint)celC;
+                            }
+                            if (omen) {
+                                if (tC + qC > 0) {
+                                    const uint c = atomic_inc(&smArc);
+                                    aSeed[c] = (ushort)s; aN[c] = (uint)(tC + qC);
+                                }
+                            } else {
+                                if (tC > 0) {
+                                    const uint c = atomic_inc(&smCT);
+                                    tSeed[c] = (ushort)s; tN[c] = (uint)tC;
+                                }
+                                if (qC > 0) {
+                                    const uint c = atomic_inc(&smCQ);
+                                    qSeed[c] = (ushort)s; qN[c] = (uint)qC;
+                                }
+                            }
+                        }
+                    }
+                    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+                    const uint C = smChains, CP = smCel, CA = smArc, CT = smCT, CQ = smCQ;
+
+                    if (C > 0u) {
+                        // ---- Buffoon rarities and editions, per (seed, ante), longest first ----
+                        SM_SORT(C, cN[c_]);
+                        for (uint i = lid; i < C; i += lsz) {
+                            const uint c = smOrder[i];
+                            const uint s = cSeed[c];
+                            const int N = (int)cN[c];
+                            const double hs = sHs[s];
+                            const int cidR = g.remap[stream_id(F_RARITY, SRC_BUF, ante, 0)];
+                            if (cidR < 0) { sSt[s] |= SM_OVERFLOW; cCnt[c] = 0u; continue; }
+                            double rst = sm_stream(s, cidR, sLo, sHi, sLen, sPre, sHave, keyChars, keyLens, keySlots);
+                            ulong rar = 0UL;
+                            uint cnt = 0u;
+                            for (int j = 0; j < N; j++) {
+                                double v;
+                                SM_DRAW(rst, hs, v);
+                                const uint r = (v > 0.95) ? R_RARE : ((v > 0.7) ? R_UNCOMMON : R_COMMON);
+                                rar |= (ulong)r << (2 * j);
+                                cnt += 1u << (8 * r);
+                            }
+                            cRar[c] = rar;
+                            cCnt[c] = cnt;
+                            ulong ed0 = 0UL;
+                            uint ed1 = 0u;
+#if WANT_EDITIONS
+                            if (passFlags & ST_EDITIONS) {
+                                const ulong va = sVouch[s];
+                                const double edRate = ((va >> V_GLOW_UP) & 1UL) ? 4.0 : (((va >> V_HONE) & 1UL) ? 2.0 : 1.0);
+                                const int cidE = g.remap[stream_id(F_EDITION, SRC_BUF, ante, 0)];
+                                if (cidE < 0) { sSt[s] |= SM_OVERFLOW; cCnt[c] = 0u; continue; }
+                                double est = sm_stream(s, cidE, sLo, sHi, sLen, sPre, sHave, keyChars, keyLens, keySlots);
+                                for (int j = 0; j < N; j++) {
+                                    double v;
+                                    SM_DRAW(est, hs, v);
+                                    const uint e = (uint)poll_edition(v, edRate, 1.0, 0);
+                                    if (j < 16) ed0 |= (ulong)e << (4 * j); else ed1 |= e << (4 * (j - 16));
+                                }
+                            }
+#endif
+                            cEd0[c] = ed0;
+                            cEd1[c] = ed1;
+                        }
+
+                        // ---- Buffoon jokers, one rarity at a time, most cards of it first ----
+                        for (int r = 0; r < 3; r++) {
+                            SM_SORT(C, (cCnt[c_] >> (8 * r)) & 0xFFu);
+                            const int poolN = (r == R_RARE) ? POOL_N_RARE : ((r == R_UNCOMMON) ? POOL_N_UNCOMMON : POOL_N_COMMON);
+                            const int fam = (r == R_RARE) ? F_JOKER3 : ((r == R_UNCOMMON) ? F_JOKER2 : F_JOKER1);
+                            const int cidJ = g.remap[stream_id(fam, SRC_BUF, ante, 0)];
+                            for (uint i = lid; i < C; i += lsz) {
+                                const uint c = smOrder[i];
+                                const int k = (int)((cCnt[c] >> (8 * r)) & 0xFFu);
+                                if (k == 0) break;          // sorted: this lane's later ones are 0 too
+                                const uint s = cSeed[c];
+                                if (cidJ < 0) { sSt[s] |= SM_OVERFLOW; continue; }
+                                const double hs = sHs[s];
+                                const ulong rar = cRar[c];
+                                const ulong ed0 = cEd0[c];
+                                const uint ed1 = cEd1[c];
+                                double jst = sm_stream(s, cidJ, sLo, sHi, sLen, sPre, sHave, keyChars, keyLens, keySlots);
+                                Match m;
+                                SM_MATCH_IN(s);
+                                int j = -1;
+                                for (int q = 0; q < k; q++) {
+                                    do { j++; } while ((int)((rar >> (2 * j)) & 3UL) != r);   // the q-th card of rarity r
+                                    double v;
+                                    SM_DRAW(jst, hs, v);
+                                    const int code = ITEM_CODE(r, rnd_index(v, poolN));
+                                    const int edition = (int)((j < 16) ? ((ed0 >> (4 * j)) & 0xFUL) : ((ed1 >> (4 * (j - 16))) & 0xFu));
+                                    OFFER(code, edition, ante, j + 1, SB_PACK);   // slot: the card's place in the ante
+                                }
+                                SM_MATCH_OUT(s);
+                            }
+                        }
+                    }
+
+#if WANT_SOULS || WANT_PLANETS
+                    if (CP > 0u) {
+                        // ---- Celestial: every card's Black Hole roll, per seed, most cards first ----
+                        const int cidB = g.remap[stream_id(F_SOUL_PLANET, 0, ante, 0)];
+                        SM_SORT(CP, pN[c_]);
+                        for (uint i = lid; i < CP; i += lsz) {
+                            const uint s = pSeed[smOrder[i]];
+                            const int N = (int)pN[smOrder[i]];
+                            if (cidB < 0) { sSt[s] |= SM_OVERFLOW; sCBH[s] = 0xFFFFFFFFu; continue; }
+                            const double hs = sHs[s];
+                            const uint kinds = sKinds[s];
+                            const int first = (int)((sVouch[s] >> V_TELESCOPE) & 1UL);
+                            double st = sm_stream(s, cidB, sLo, sHi, sLen, sPre, sHave, keyChars, keyLens, keySlots);
+                            Match m;
+                            SM_MATCH_IN(s);
+                            uint bh = 0u;
+                            for (int j = 0; j < N; j++) {
+                                double v;
+                                SM_DRAW(st, hs, v);
+                                if (v > 0.997) {
+                                    bh |= 1u << j;
+                                    OFFER(CODE_BLACK_HOLE, 0, ante, sm_slot(kinds, ante, PACK_CELESTIAL, first, j, packFamily, packSize), SB_PACK);
+                                }
+                            }
+                            SM_MATCH_OUT(s);
+                            sCBH[s] = bh;
+                        }
+#if WANT_PLANETS
+                        if (passFlags & ST_PLANETS) {
+                            // ---- then the planets, for the cards that were not a Black Hole ----
+                            const int cidP = g.remap[stream_id(F_PLANET, SRC_PL1, ante, 0)];
+                            SM_SORT(CP, pN[c_] - popcount(sCBH[pSeed[c_]]));
+                            for (uint i = lid; i < CP; i += lsz) {
+                                const uint s = pSeed[smOrder[i]];
+                                const int N = (int)pN[smOrder[i]];
+                                const uint bh = sCBH[s];
+                                if (bh == 0xFFFFFFFFu) continue;                 // overflowed above
+                                if (N - popcount(bh) == 0) break;                // sorted: the rest have none
+                                if (cidP < 0) { sSt[s] |= SM_OVERFLOW; continue; }
+                                const double hs = sHs[s];
+                                const uint kinds = sKinds[s];
+                                const int first = (int)((sVouch[s] >> V_TELESCOPE) & 1UL);
+                                double st = sm_stream(s, cidP, sLo, sHi, sLen, sPre, sHave, keyChars, keyLens, keySlots);
+                                Match m;
+                                SM_MATCH_IN(s);
+                                for (int j = 0; j < N; j++) {
+                                    if ((bh >> j) & 1u) continue;
+                                    double v;
+                                    SM_DRAW(st, hs, v);
+                                    OFFER(PLANET_BASE | rnd_index(v, POOL_N_PLANETS), 0, ante,
+                                          sm_slot(kinds, ante, PACK_CELESTIAL, first, j, packFamily, packSize), SB_PACK);
+                                }
+                                SM_MATCH_OUT(s);
+                            }
+                        }
+#endif
+                    }
+#endif
+
+#if WANT_TAROTS || WANT_SOULS
+                    if (CT > 0u) {
+                        // ---- Arcana (no Omen Globe): every card's Soul roll ----
+                        const int cidS = g.remap[stream_id(F_SOUL_TAROT, 0, ante, 0)];
+                        SM_SORT(CT, tN[c_]);
+                        for (uint i = lid; i < CT; i += lsz) {
+                            const uint s = tSeed[smOrder[i]];
+                            const int N = (int)tN[smOrder[i]];
+                            if (cidS < 0) { sSt[s] |= SM_OVERFLOW; sTSoul[s] = 0xFFFFFFFFu; continue; }
+                            const double hs = sHs[s];
+                            const uint kinds = sKinds[s];
+                            double st = sm_stream(s, cidS, sLo, sHi, sLen, sPre, sHave, keyChars, keyLens, keySlots);
+                            Match m;
+                            SM_MATCH_IN(s);
+                            uint souls = 0u;
+                            for (int j = 0; j < N; j++) {
+                                double v;
+                                SM_DRAW(st, hs, v);
+                                if (v > 0.997) {
+                                    souls |= 1u << j;
+                                    OFFER(CODE_SOUL, 0, ante, sm_slot(kinds, ante, PACK_ARCANA, 0, j, packFamily, packSize), SB_PACK);
+                                }
+                            }
+                            SM_MATCH_OUT(s);
+                            sTSoul[s] = souls;
+                        }
+#if WANT_TAROTS
+                        if (passFlags & ST_TAROTS) {
+                            // ---- then the tarots, for the cards that were not a Soul ----
+                            const int cidT = g.remap[stream_id(F_TAROT, SRC_AR1, ante, 0)];
+                            SM_SORT(CT, tN[c_] - popcount(sTSoul[tSeed[c_]]));
+                            for (uint i = lid; i < CT; i += lsz) {
+                                const uint s = tSeed[smOrder[i]];
+                                const int N = (int)tN[smOrder[i]];
+                                const uint souls = sTSoul[s];
+                                if (souls == 0xFFFFFFFFu) continue;
+                                if (N - popcount(souls) == 0) break;
+                                if (cidT < 0) { sSt[s] |= SM_OVERFLOW; continue; }
+                                const double hs = sHs[s];
+                                const uint kinds = sKinds[s];
+                                double st = sm_stream(s, cidT, sLo, sHi, sLen, sPre, sHave, keyChars, keyLens, keySlots);
+                                Match m;
+                                SM_MATCH_IN(s);
+                                for (int j = 0; j < N; j++) {
+                                    if ((souls >> j) & 1u) continue;
+                                    double v;
+                                    SM_DRAW(st, hs, v);
+                                    OFFER(TAROT_BASE | rnd_index(v, POOL_N_TAROTS), 0, ante,
+                                          sm_slot(kinds, ante, PACK_ARCANA, 0, j, packFamily, packSize), SB_PACK);
+                                }
+                                SM_MATCH_OUT(s);
+                            }
+                        }
+#endif
+                    }
+#endif
+
+#if WANT_SOULS || WANT_SPECTRALS
+                    if (CQ > 0u) {
+                        // ---- Spectral packs (no Omen Globe): each card's Soul and Black Hole
+                        // rolls, two draws on one stream; Black Hole wins when both hit. ----
+                        const int cidQ = g.remap[stream_id(F_SOUL_SPECTRAL, 0, ante, 0)];
+                        SM_SORT(CQ, qN[c_]);
+                        for (uint i = lid; i < CQ; i += lsz) {
+                            const uint s = qSeed[smOrder[i]];
+                            const int N = (int)qN[smOrder[i]];
+                            if (cidQ < 0) { sSt[s] |= SM_OVERFLOW; sQSoul[s] = 0u; sQRet[s] = 0u; continue; }
+                            const double hs = sHs[s];
+                            const uint kinds = sKinds[s];
+                            double st = sm_stream(s, cidQ, sLo, sHi, sLen, sPre, sHave, keyChars, keyLens, keySlots);
+                            Match m;
+                            SM_MATCH_IN(s);
+                            uint souls = 0u, plain = 0u;
+                            for (int j = 0; j < N; j++) {
+                                double v1, v2;
+                                SM_DRAW(st, hs, v1);
+                                SM_DRAW(st, hs, v2);
+                                const int slot = sm_slot(kinds, ante, PACK_SPECTRAL, 0, j, packFamily, packSize);
+                                if (v2 > 0.997) OFFER(CODE_BLACK_HOLE, 0, ante, slot, SB_PACK);
+                                else if (v1 > 0.997) { souls |= 1u << j; OFFER(CODE_SOUL, 0, ante, slot, SB_PACK); }
+                                else plain |= 1u << j;
+                            }
+                            SM_MATCH_OUT(s);
+                            sQSoul[s] = souls;
+                            sQRet[s] = (WANT_SPECTRALS && (passFlags & ST_SPECTRALS)) ? plain : 0u;
+                        }
+#if WANT_SPECTRALS
+                        if (passFlags & ST_SPECTRALS) {
+                            // ---- then the spectral cards themselves. A draw that lands on The
+                            // Soul or Black Hole (never available there) is redrawn on the next
+                            // resample stream, so round r draws, in card order, for every card
+                            // still waiting after round r - 1. ----
+                            for (int r = 0; r < MAX_RESAMPLE; r++) {
+                                barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+                                if (lid == 0) smAny = 0u;
+                                barrier(CLK_LOCAL_MEM_FENCE);
+                                const int cidR = g.remap[stream_id(F_SPECTRAL, SRC_SPE, ante, r)];
+                                for (uint i = lid; i < CQ; i += lsz) {
+                                    const uint s = qSeed[i];
+                                    const int N = (int)qN[i];
+                                    const uint pend = sQRet[s];
+                                    if (pend == 0u) continue;
+                                    if (cidR < 0) { sSt[s] |= SM_OVERFLOW; sQRet[s] = 0u; continue; }
+                                    const double hs = sHs[s];
+                                    const uint kinds = sKinds[s];
+                                    double st = sm_stream(s, cidR, sLo, sHi, sLen, sPre, sHave, keyChars, keyLens, keySlots);
+                                    Match m;
+                                    SM_MATCH_IN(s);
+                                    uint again = 0u;
+                                    for (int j = 0; j < N; j++) {
+                                        if (!((pend >> j) & 1u)) continue;
+                                        double v;
+                                        SM_DRAW(st, hs, v);
+                                        const int idx = rnd_index(v, POOL_N_SPECTRALS);
+                                        if ((SPECTRAL_RETRY_MASK >> idx) & 1UL) again |= 1u << j;
+                                        else OFFER(SPECTRAL_BASE | idx, 0, ante,
+                                                   sm_slot(kinds, ante, PACK_SPECTRAL, 0, j, packFamily, packSize), SB_PACK);
+                                    }
+                                    SM_MATCH_OUT(s);
+                                    sQRet[s] = again;
+                                    if (again) smAny = 1u;
+                                }
+                                barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+                                if (smAny == 0u) break;
+                            }
+                            // Still waiting after the last resample stream: the ordinary code
+                            // gives up there too, and the CPU decides.
+                            for (uint i = lid; i < CQ; i += lsz) {
+                                const uint s = qSeed[i];
+                                if (sQRet[s]) { sSt[s] |= SM_OVERFLOW; sQRet[s] = 0u; }
+                            }
+                        }
+#endif
+                    }
+#endif
+
+#if WANT_SOUL_JOKERS
+                    if ((passFlags & ST_SOUL_JOKERS) && (CT > 0u || CQ > 0u)) {
+                        // ---- the legendaries, per seed with Souls (rare): its Souls in pack
+                        // order, through the ordinary SOUL_FOUND in lane context. ----
+                        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+                        for (uint i = lid; i < L; i += lsz) {
+                            const uint s = live[i];
+                            if (sSt[s] & SM_OVERFLOW) continue;
+                            const ulong va = sVouch[s];
+                            if ((va >> V_OMEN_GLOBE) & 1UL) continue;           // handled with the Omen Globe seeds
+                            const uint tsoul = sTSoul[s], qsoul = sQSoul[s];
+                            if ((tsoul | qsoul) == 0u) continue;
+                            SM_CTX_IN(s);
+                            const uint have0 = g.havePrefix;
+                            SM_RUN_IN(s);
+                            Match m;
+                            SM_MATCH_IN(s);
+                            uint legendaryTaken = sLeg[s];
+                            int soulCount = (int)sSoul[s];
+                            const double edRate = ((va >> V_GLOW_UP) & 1UL) ? 4.0 : (((va >> V_HONE) & 1UL) ? 2.0 : 1.0);
+                            const uint kinds = sKinds[s];
+                            const int packs = (ante == 1) ? 4 : 6;
+                            const int arcOn = (passFlags & (ST_TAROTS | ST_SOULS)) != 0;
+                            const int speOn = (passFlags & (ST_SOULS | ST_SPECTRALS)) != 0;
+                            int ja = 0, jq = 0;
+                            for (int p = 0; p < packs && !g.overflow; p++) {
+                                const int kind = (int)((kinds >> (4 * p)) & 0xFu);
+                                const int fm = packFamily[kind];
+                                if (fm == PACK_ARCANA && arcOn) {
+                                    for (int c = 0; c < packSize[kind] && !g.overflow; c++, ja++) {
+                                        if ((tsoul >> ja) & 1u) SOUL_FOUND(ante);
+                                    }
+                                } else if (fm == PACK_SPECTRAL && speOn) {
+                                    for (int c = 0; c < packSize[kind] && !g.overflow; c++, jq++) {
+                                        if ((qsoul >> jq) & 1u) SOUL_FOUND(ante);
+                                    }
+                                }
+                            }
+                            (void)edRate;
+                            if (g.overflow) sSt[s] |= SM_OVERFLOW;
+                            sLeg[s] = legendaryTaken;
+                            sSoul[s] = (uint)soulCount;
+                            SM_MATCH_OUT(s);
+                            SM_RUN_OUT(s);
+                            SM_CTX_OUT(s, have0);
+                        }
+                    }
+#endif
+
+#if WANT_TAROTS || WANT_SOULS || WANT_SPECTRALS
+                    if (CA > 0u) {
+                        // ---- Seeds holding Omen Globe: their Arcana and Spectral cards one by
+                        // one in pack order (lane context), since Omen Globe's run-long roll
+                        // turns Tarot slots into Spectral ones. The run-long streams (Omen Globe,
+                        // the legendary queue) and the legendaries taken so far come from the
+                        // seed's scratch and go back to it. ----
+                        SM_SORT(CA, aN[c_]);
+                        for (uint i = lid; i < CA; i += lsz) {
+                            const uint s = aSeed[smOrder[i]];
+                            SM_CTX_IN(s);
+                            const uint have0 = g.havePrefix;
+                            SM_RUN_IN(s);
+                            Match m;
+                            SM_MATCH_IN(s);
+                            uint legendaryTaken = sLeg[s];
+                            int soulCount = (int)sSoul[s];
+                            const ulong va = sVouch[s];
+                            const double edRate = ((va >> V_GLOW_UP) & 1UL) ? 4.0 : (((va >> V_HONE) & 1UL) ? 2.0 : 1.0);
+                            const int omenGlobe = (int)((va >> V_OMEN_GLOBE) & 1UL);
+                            const int arcOn = (passFlags & (ST_TAROTS | ST_SOULS)) || ((passFlags & ST_SPECTRALS) && omenGlobe);
+                            const int speOn = (passFlags & (ST_SOULS | ST_SPECTRALS)) != 0;
+                            const uint kinds = sKinds[s];
+                            const int packs = (ante == 1) ? 4 : 6;
+                            for (int p = 0; p < packs && !g.overflow; p++) {
+                                const int kind = (int)((kinds >> (4 * p)) & 0xFu);
+                                const int fm = packFamily[kind];
+                                if (fm == PACK_SPECTRAL && speOn) {
+                                    for (int c = 0; c < packSize[kind] && !g.overflow; c++) {
+                                        SPECTRAL_SLOT(ante, SRC_SPE, c + 1);
+                                    }
+                                } else if (fm == PACK_ARCANA && arcOn) {
+                                    for (int c = 0; c < packSize[kind] && !g.overflow; c++) {
+                                        // An Arcana card, exactly as in the ordinary pack loop.
+                                        if (omenGlobe && RND(F_OMEN_GLOBE, 0, 0, 0) > 0.8) {
+                                            SPECTRAL_SLOT(ante, SRC_AR2, c + 1);
+                                            continue;
+                                        }
+#if WANT_TAROTS
+                                        if (passFlags & ST_TAROTS) {
+                                            if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
+                                                OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
+                                                SOUL_FOUND(ante);
+                                            } else {
+                                                const int tIdx = rnd_index(RND(F_TAROT, SRC_AR1, ante, 0), POOL_N_TAROTS);
+                                                OFFER(TAROT_BASE | tIdx, 0, ante, c + 1, SB_PACK);
+                                            }
+                                            continue;
+                                        }
+#endif
+                                        if (passFlags & ST_SOULS) {
+                                            if (RND(F_SOUL_TAROT, 0, ante, 0) > 0.997) {
+                                                OFFER(CODE_SOUL, 0, ante, c + 1, SB_PACK);
+                                                SOUL_FOUND(ante);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            (void)edRate; (void)legendaryTaken; (void)soulCount;
+                            if (g.overflow) sSt[s] |= SM_OVERFLOW;
+                            sLeg[s] = legendaryTaken;
+                            sSoul[s] = (uint)soulCount;
+                            SM_MATCH_OUT(s);
+                            SM_RUN_OUT(s);
+                            SM_CTX_OUT(s, have0);
+                        }
+                    }
+#endif
+                    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+                    // ---- the end-of-ante decision, per live seed ----
+                    for (uint i = lid; i < L; i += lsz) {
+                        const uint s = live[i];
+                        const uint st = sSt[s];
+                        int queue = 0, keep = 0;
+                        if (st & SM_OVERFLOW) {
+                            queue = 1;                   // undecided: the next pass decides
+                        } else {
+                            Match m;
+                            SM_MATCH_IN(s);
+                            CLOSE_ANTE(ante);
+                            if (!m.dead) {
+                                if (m.unmet == 0 || ante == lastAnte) queue = 1;
+                                else keep = 1;
+                            }
+                        }
+                        if (queue) SM_PUSH(grabbed + s);
+                        if (keep) nextLive[atomic_inc(&smNext)] = (ushort)s;
+                    }
+                    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+                    if (lid == 0) smLive = smNext;
+                    { __global ushort *t = live; live = nextLive; nextLive = t; }
+                    barrier(CLK_LOCAL_MEM_FENCE);
+                }
+            }
+            phaseN = 0u;
+#else
             phaseN = grabEnd - grabbed;
+#endif
         } else {
             barrier(CLK_LOCAL_MEM_FENCE);
             queued = lQn;
@@ -808,8 +1593,14 @@ __kernel void search(
         if (grabbed >= (uint)chunkSize) break;
         const uint grabEnd = min(grabbed + grabPerGroup, (uint)chunkSize);
 
-    for (uint seedOff = grabbed + lid; seedOff < grabEnd; seedOff += lsz) {
+    for (uint seedIx = grabbed + lid; seedIx < grabEnd; seedIx += lsz) {
+#if ROUND_KERNEL == 2
+        const uint seedOff = smQueue[seedIx];      // chunkSize is the queue's length here
+        const int passLo = 1, passHi = NUM_STAGES;
+#else
+        const uint seedOff = seedIx;
         const int passLo = 0, passHi = NUM_STAGES;
+#endif
 #endif
 
         g.seedLen = seed_for_index(baseIndex + (ulong)seedOff, &g.seedLo, &g.seedHi);

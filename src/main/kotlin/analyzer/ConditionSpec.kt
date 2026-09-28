@@ -229,6 +229,14 @@ fun applySettings(base: RunOptions, raw: Any?, validate: Boolean = true): RunOpt
     else int("localSize", "--local-size")?.let { o = o.copy(localSize = it) }
     if (s["chunk"]?.toString()?.trim()?.equals("auto", ignoreCase = true) == true) o = o.copy(chunk = 0)
     else int("chunk", "--chunk")?.let { o = o.copy(chunk = it) }
+    s["nvRegistersR1"]?.let { v ->
+        val text = if (v is Number) v.toLong().toString() else v.toString()
+        try {
+            o = o.copy(nvRegistersR1 = Cli.parseNvRegisters(text))
+        } catch (e: CliError) {
+            throw SpecError("round 1 register cap: ${e.message}")
+        }
+    }
     s["nvRegisters"]?.let { v ->
         val text = if (v is Number) v.toLong().toString() else v.toString()
         try {
@@ -253,6 +261,13 @@ fun applySettings(base: RunOptions, raw: Any?, validate: Boolean = true): RunOpt
         (s["splitPacks"] as? String)?.takeIf { it.isNotBlank() }?.let {
             o = o.copy(splitPacks = Cli.parseChoice("split pack cards", it, "auto", "on", "off"))
         }
+        (s["stageMajor"] as? String)?.takeIf { it.isNotBlank() }?.let {
+            o = o.copy(stageMajor = Cli.parseChoice("stage-major first check", it, "auto", "on", "off"))
+        }
+        (s["splitRounds"] as? String)?.takeIf { it.isNotBlank() }?.let {
+            o = o.copy(splitRounds = Cli.parseChoice("split rounds", it, "auto", "on", "off"))
+        }
+
         s["rngTable"]?.let { v ->
             o = o.copy(rngTable = Cli.parseRngTable(if (v is Number) v.toLong().toString() else v.toString()))
         }
@@ -286,6 +301,9 @@ fun settingsToJson(o: RunOptions): Map<String, Any?> = mapOf(
     "stateReset" to o.stateReset,
     "twoRound" to o.twoRound,
     "splitPacks" to o.splitPacks,
+    "stageMajor" to o.stageMajor,
+    "splitRounds" to o.splitRounds,
+    "nvRegistersR1" to if (o.nvRegistersR1 < 0) "auto" else o.nvRegistersR1,
     "rngTable" to when { o.rngTable < 0 -> "auto"; o.rngTable == 0 -> "off"; else -> o.rngTable.toString() },
 )
 

@@ -199,6 +199,9 @@ fun runSearch(config: SearchConfig): List<SeedResult> {
     ClSearch.STATE_RESET = opts.stateReset
     ClSearch.TWO_ROUND = opts.twoRound
     ClSearch.SPLIT_PACKS = opts.splitPacks
+    ClSearch.STAGE_MAJOR = opts.stageMajor
+    ClSearch.SPLIT_ROUNDS = opts.splitRounds
+    ClSearch.NV_MAX_REGISTERS_R1 = opts.nvRegistersR1
     ClSearch.RNG_TABLE_BITS = opts.rngTable
     val useGpu = opts.useGpu
     val startIndex = opts.startIndex
@@ -220,7 +223,7 @@ fun runSearch(config: SearchConfig): List<SeedResult> {
                     ", prefix cache ${opts.prefixCache}" + (if (!opts.forceInline) ", no forced inlining" else "") +
                     ", stream reset ${opts.stateReset}, two-round ${opts.twoRound}, rng table " +
                     when { opts.rngTable < 0 -> "auto"; opts.rngTable == 0 -> "off"; else -> "${opts.rngTable}-bit" } +
-                    ", split packs ${opts.splitPacks}"
+                    ", split packs ${opts.splitPacks}, stage-major ${opts.stageMajor}, split rounds ${opts.splitRounds}"
             else "CPU only"))
     println("Skipping vouchers: ${ignoredVouchers.joinToString(", ").ifEmpty { "none" }}")
 

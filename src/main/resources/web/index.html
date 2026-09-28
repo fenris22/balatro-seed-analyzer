@@ -404,11 +404,14 @@
               <div class="field"><label for="sReset">Stream reset</label><select class="inp" id="sReset" data-setting="stateReset"><option value="auto">Auto</option><option value="tags">Tags</option><option value="clear">Clear</option></select><span class="hint">How the GPU marks random streams unused for each seed. Tags keeps a bit per stream in registers; Clear writes every slot in memory</span></div>
               <div class="field"><label for="sTwoRound">Two-round scan</label><select class="inp" id="sTwoRound" data-setting="twoRound"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select><span class="hint">The first quick check on a batch of seeds first, then the other checks and the full scan on the survivors together. Only matters when the search has quick checks</span></div>
               <div class="field"><label for="sSplitPacks">Split pack cards</label><select class="inp" id="sSplitPacks" data-setting="splitPacks"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select><span class="hint">In the quick checks, deals an ante's pack cards one pack family at a time so the GPU's lanes stay in step</span></div>
+              <div class="field"><label for="sStageMajor">Stage-major first check</label><select class="inp" id="sStageMajor" data-setting="stageMajor"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select><span class="hint">Runs the first quick check over a batch of seeds one kind of work at a time, so the GPU's lanes stay busy. Pack-joker checks, with the two-round scan</span></div>
+              <div class="field"><label for="sSplitRounds">Split rounds</label><select class="inp" id="sSplitRounds" data-setting="splitRounds"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select><span class="hint">Builds the stage-major first check and the rest of the search as two GPU programs, each with its own register budget</span></div>
               <div class="field"><label for="sRngTable">RNG table</label><select class="inp" id="sRngTable" data-setting="rngTable"><option value="auto">Auto</option><option value="off">Off</option><option value="4">4-bit (8 KB)</option><option value="8">8-bit (64 KB)</option><option value="16">16-bit (8 MB)</option></select><span class="hint">Replaces the random generator's step-by-step math with table lookups</span></div>
             </div>
             <details class="more" style="margin-top:14px">
               <summary>NVIDIA only</summary>
               <div class="inner grid-side">
+                <div class="field"><label for="sNvRegsR1">Register cap, first check</label><input class="inp" id="sNvRegsR1" data-setting="nvRegistersR1" placeholder="Auto"><span class="hint">With split rounds, the cap for the stage-major first check. Auto allows twice the full-occupancy cap; 0 leaves it to the compiler</span></div>
                 <div class="field"><label for="sNvRegs">Register cap per thread</label><input class="inp" id="sNvRegs" data-setting="nvRegisters" placeholder="Auto"><span class="hint">Auto caps registers so each compute unit can run its full number of threads; 0 leaves it to the compiler</span></div>
               </div>
             </details>
@@ -571,7 +574,7 @@
   /** The automatic GPU settings, whatever the program was started with. */
   const GPU_AUTO = { chunk: "auto", localSize: "auto", globalSize: 4096, calibrationSeeds: 4000000,
     prefixCache: "auto", forceInline: true, eagerPrefix: false, nvRegisters: "auto",
-    stateReset: "auto", twoRound: "auto", rngTable: "auto", splitPacks: "auto" };
+    stateReset: "auto", twoRound: "auto", rngTable: "auto", splitPacks: "auto", stageMajor: "auto", splitRounds: "auto", nvRegistersR1: "auto" };
   function save() {
     try {
       const kept = {};

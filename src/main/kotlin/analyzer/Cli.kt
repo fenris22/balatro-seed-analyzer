@@ -42,6 +42,12 @@ data class RunOptions(
     val twoRound: String = "auto",
     /** auto, on or off: deal a stage's Buffoon pack cards in one loop per ante. */
     val splitPacks: String = "auto",
+    /** auto, on or off: run the first prefilter stage stage-major (see ClSearch.STAGE_MAJOR). */
+    val stageMajor: String = "auto",
+    /** auto, on or off: build the stage-major round and the per-seed round as separate kernels. */
+    val splitRounds: String = "auto",
+    /** Nvidia register cap for the stage-major round when the rounds are split: -1 auto, 0 compiler, or N. */
+    val nvRegistersR1: Int = -1,
     /** Leap-ahead RNG table width: -1 auto, 0 off, 4, 8 or 16. */
     val rngTable: Int = -1,
 ) {
@@ -104,8 +110,16 @@ object Cli {
                 "first, then the other checks and the full scan only on the survivors, together (default auto: on)"),
         Flag("--split-packs", "MODE", "auto, on or off: in the prefilter checks, roll an ante's pack kinds " +
                 "first and deal its cards one pack family at a time, so GPU lanes stay in step (default auto: on)"),
+        Flag("--stage-major", "MODE", "auto, on or off: run the first quick check over a batch of seeds " +
+                "one kind of work at a time, so GPU lanes stay busy (pack-joker checks, with --two-round; default auto: on)"),
+        Flag("--split-rounds", "MODE", "auto, on or off: build the stage-major first check and the rest of the " +
+                "search as two GPU programs, each with its own register budget (default auto: on with --stage-major)"),
+        Flag("--nv-registers-r1", "N", "NVIDIA: register cap for the stage-major first check when the rounds are " +
+                "split: auto, 0 (compiler's choice) or a number (default auto: twice the full-occupancy cap, or the " +
+                "full-occupancy cap when the first check has Arcana, Spectral or Soul work)"),
         Flag("--rng-table", "BITS", "auto, off, 4, 8 or 16: replace the random generator's 44 dependent steps " +
-                "with table lookups (4: 8 KB in shared memory, 8: 64 KB, 16: 8 MB). Default auto: off; benchmark it"),
+                "with table lookups (4: 8 KB in shared memory, 8: 64 KB, 16: 8 MB). Default auto: 4 when the first " +
+                "quick check has more than Buffoon jokers (Souls, tarots, planets, spectrals, vouchers), otherwise off"),
         Flag("--no-inline", null, "Let the GPU compiler decide what to inline instead of forcing it"),
         Flag("--examine", "SEED", "Print antes 1-8 of one seed in full and exit, without searching"),
         Flag("--conditions", "FILE", "Search the conditions in FILE (saved from the web page) without the " +
@@ -280,6 +294,9 @@ object Cli {
                 "--state-reset" -> o.copy(stateReset = parseChoice(name, value, "auto", "tags", "clear"))
                 "--two-round" -> o.copy(twoRound = parseChoice(name, value, "auto", "on", "off"))
                 "--split-packs" -> o.copy(splitPacks = parseChoice(name, value, "auto", "on", "off"))
+                "--stage-major" -> o.copy(stageMajor = parseChoice(name, value, "auto", "on", "off"))
+                "--split-rounds" -> o.copy(splitRounds = parseChoice(name, value, "auto", "on", "off"))
+                "--nv-registers-r1" -> o.copy(nvRegistersR1 = parseNvRegisters(value))
                 "--rng-table" -> o.copy(rngTable = parseRngTable(value))
                 "--host" -> o.copy(host = value.trim())
                 "--port" -> {

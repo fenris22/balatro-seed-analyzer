@@ -155,7 +155,47 @@ object ClSearch {
      */
     var SPLIT_PACKS = "auto"
 
-    /** Leap-ahead RNG table width: 0 (off), 4, 8 or 16 bits, or -1 for auto (off). Set from --rng-table. */
+    /**
+     * "on" runs the first prefilter stage stage-major: a whole grab of seeds at once, one
+     * kind of work at a time (pack kinds, then rarities and editions, then jokers by rarity),
+     * with the work sorted so a wave's lanes get equal shares. Needs the two-round scan and
+     * stream tags. "auto" is on: 1.1-2.5x faster on the 9070 XT across joker, Soul, tarot,
+     * planet and spectral first stages. Set from --stage-major.
+     */
+    var STAGE_MAJOR = "auto"
+
+    /**
+     * "on" builds the stage-major round and the ordinary per-seed round as two kernels, each
+     * with only its own code, so each gets its own register allocation and Nvidia register
+     * cap (see NV_MAX_REGISTERS_R1). "auto" is on whenever stage-major is. Set from --split-rounds.
+     */
+    var SPLIT_ROUNDS = "auto"
+
+    /**
+     * Register cap for the stage-major round on Nvidia when the rounds are split: -1 auto
+     * (the register file over half the SM's threads: 64 where an SM holds 2048), 0 the
+     * compiler's choice, or N. Set from --nv-registers-r1.
+     */
+    var NV_MAX_REGISTERS_R1 = NV_REGISTERS_AUTO
+
+    /** Auto-tuning: chunks left alone while the chunk size ramps up, then chunks per variant. */
+    private const val TUNE_FIRST = 3
+    private const val TUNE_ROUNDS = 3
+
+    /** Split rounds: round 1 stops taking seeds once this many wait for round 2. */
+    private const val SM_QUEUE_CAP = 4L shl 20
+
+    /** Seeds per work item in one stage-major grab. */
+    private const val SM_SEEDS_PER_LANE = 8
+
+    /**
+     * Leap-ahead RNG table width: 0 (off), 4, 8 or 16 bits, or -1 for auto. Auto measures:
+     * when the first stage does more than Buffoon jokers (other families or vouchers), both
+     * the plain kernel and the 4-bit table (8 KB of shared memory) are built, the first chunks
+     * after warm-up alternate between them, and the faster one is kept. It helped those
+     * searches by 4-6% on an A100 and cost up to 6% on a 9070 XT; plain joker stages were
+     * neutral to -5%, so they keep it off. Set from --rng-table.
+     */
     var RNG_TABLE_BITS = -1
 
     class Unsupported(msg: String) : Exception(msg)
@@ -235,6 +275,21 @@ object ClSearch {
 
     /** Stage must track vouchers; matches ST_VOUCHERS in search.cl. */
     private const val ST_VOUCHERS = 64
+    private const val ST_JOKERS = 1
+    private const val ST_EDITIONS = 2
+    private const val ST_SOULS = 4
+    private const val ST_SOUL_JOKERS = 8
+    private const val ST_TAROTS = 16
+    private const val ST_SPECTRALS = 32
+
+    /** A stage's STAGE_FLAGS entry: what it generates, plus whether it tracks vouchers. */
+    private fun stageFlagWord(stage: PrefilterStage, conditions: Array<Condition>, detail: Detail): Int =
+        stageFlags(SearchPlanner.clampTo(stage, detail)) or (if (stage.needsVouchers(conditions)) ST_VOUCHERS else 0)
+
+    /** Stage-major scratch bytes per seed in flight; must match the layout in search.cl. */
+    private fun smSeedBytes(lenSlots: Int, runStreams: Int): Long =
+        7L * 8 + 8 + 8L * (lenSlots + runStreams) + 17 * 4 + 7 * 2 + 6
+
 
     /** Stage content flags, matching ST_* in search.cl. */
     private fun stageFlags(d: Detail): Int =
@@ -677,7 +732,8 @@ object ClSearch {
             ?: error("search.cl not found on the classpath or at opencl/search.cl")
 
     /** The experimental kernel switches, resolved from their "auto" settings for one run. */
-    private data class KernelOpts(val stateTags: Boolean, val twoRound: Boolean, val rngBits: Int, val splitPacks: Boolean)
+    private data class KernelOpts(val stateTags: Boolean, val twoRound: Boolean, val rngBits: Int, val splitPacks: Boolean,
+                                  val stageMajor: Boolean)
 
     private fun buildDefines(
         conditions: Array<Condition>,
@@ -695,7 +751,10 @@ object ClSearch {
         d("STATE_TAGS", if (kernelOpts.stateTags) 1 else 0)
         d("COMPACT", if (kernelOpts.twoRound) 1 else 0)
         d("SPLIT_PACKS", if (kernelOpts.splitPacks) 1 else 0)
-        d("GRAB_SIZE", maxOf(512L, localSize))
+        d("STAGE_MAJOR", if (kernelOpts.stageMajor) 1 else 0)
+        d("GRAB_SIZE", if (kernelOpts.stageMajor) localSize * SM_SEEDS_PER_LANE else maxOf(512L, localSize))
+        d("SM_SEED_BYTES", smSeedBytes(streams.lenSlotCount, streams.runStreams))
+        d("SM_RUN_N", streams.runStreams)
         d("RNG_TABLE_BITS", kernelOpts.rngBits)
         d("NUM_CONDS", conditions.size)
         d("MAX_SEARCH_ANTE", maxSearchAnte)
@@ -787,8 +846,7 @@ object ClSearch {
         if (stages.isNotEmpty()) {
             d("STAGE_MAX_ANTE_INIT", stages.joinToString(",", "{", "}") { it.maxAnte.toString() })
             d("STAGE_FLAGS_INIT", stages.joinToString(",", "{", "}") {
-                (stageFlags(SearchPlanner.clampTo(it, detail)) or
-                        (if (it.needsVouchers(conditions)) ST_VOUCHERS else 0)).toString()
+                stageFlagWord(it, conditions, detail).toString()
             })
             d("STAGE_MASK_INIT", stages.joinToString(",", "{", "}") { st ->
                 var mask = 0
@@ -990,6 +1048,14 @@ object ClSearch {
         args.add(keep(roInts(streams.remap)))
         args.add(keep(roInts(streams.anteEnd)))
 
+        // Stage-major runs any first stage, as long as the two-round scan is on and every
+        // ante's streams fit the tag masks (it clears tags per phase).
+        val smWhyNot = when {
+            stages.isEmpty() -> "no prefilter stages"
+            TWO_ROUND == "off" -> "needs --two-round"
+            !streams.tagsFit || STATE_RESET == "clear" -> "needs stream tags"
+            else -> null
+        }
         val kernelOpts = KernelOpts(
             stateTags = when (STATE_RESET) {
                 "tags" -> {
@@ -1001,20 +1067,42 @@ object ClSearch {
                 else -> streams.tagsFit
             },
             twoRound = TWO_ROUND != "off" && stages.isNotEmpty(),
-            rngBits = if (RNG_TABLE_BITS < 0) 0 else RNG_TABLE_BITS,
+            rngBits = if (RNG_TABLE_BITS >= 0) RNG_TABLE_BITS else 0,
             splitPacks = SPLIT_PACKS != "off",
+            stageMajor = STAGE_MAJOR != "off" && smWhyNot == null,
         )
+        // Auto RNG table: worth measuring only for a first stage with more than Buffoon jokers.
+        val tuneTable = RNG_TABLE_BITS < 0 && stages.isNotEmpty() && TWO_ROUND != "off" &&
+                (stageFlagWord(stages[0], conditions, detail) and (ST_JOKERS or ST_EDITIONS).inv()) != 0 &&
+                deviceLong(device, DEVICE_LOCAL_MEM_SIZE) >= 32L * 1024
         // Leap-ahead table, or an 8-byte placeholder so the kernel's parameter list never changes.
-        val rngTable = if (kernelOpts.rngBits > 0) RngTable.build(kernelOpts.rngBits) else LongArray(1)
+        val rngTable = if (kernelOpts.rngBits > 0) RngTable.build(kernelOpts.rngBits)
+            else if (tuneTable) RngTable.build(4) else LongArray(1)
         args.add(keep(clCreateBuffer(context, CL_MEM_READ_ONLY or CL_MEM_COPY_HOST_PTR,
             rngTable.size.toLong() * Sizeof.cl_ulong, Pointer.to(rngTable), null)))
+        // Stage-major scratch: every work group holds GRAB_SIZE = local size x SM_SEEDS_PER_LANE
+        // seeds, so the total is the global size x SM_SEEDS_PER_LANE seeds whatever the local size.
+        val smBytes = if (kernelOpts.stageMajor) globalSize * SM_SEEDS_PER_LANE * smSeedBytes(streams.lenSlotCount, streams.runStreams) else 8L
+        args.add(keep(clCreateBuffer(context, CL_MEM_READ_WRITE, smBytes, null, null)))
+        // Split rounds: the queue from round 1 to round 2. Every group that passed the "queue
+        // nearly full" check may still add a whole grab, hence the margin.
+        val splitRounds = kernelOpts.stageMajor && SPLIT_ROUNDS != "off"
+        val queueLen = if (splitRounds) SM_QUEUE_CAP + globalSize * SM_SEEDS_PER_LANE + 1024 else 1L
+        val bSmQueue = keep(clCreateBuffer(context, CL_MEM_READ_WRITE, queueLen * Sizeof.cl_uint, null, null))
+        val bSmQueueN = keep(clCreateBuffer(context, CL_MEM_READ_WRITE, Sizeof.cl_uint.toLong(), null, null))
+        args.add(bSmQueue); args.add(bSmQueueN)
         if (!quiet) {
             println("${label}Stream reset: ${if (kernelOpts.stateTags) "tags" else "clear"}" +
                     (if (STATE_RESET == "auto") " (auto)" else "") +
                     " | two-round: ${if (kernelOpts.twoRound) "on" else "off"}" +
                     (if (TWO_ROUND == "on" && stages.isEmpty()) " (no prefilter stages)" else "") +
                     " | RNG table: ${if (kernelOpts.rngBits > 0) "${kernelOpts.rngBits}-bit, ${rngTable.size * 8L / 1024} KB" else "off"}" +
-                    " | split packs: ${if (kernelOpts.splitPacks) "on" else "off"}" + (if (SPLIT_PACKS == "auto") " (auto)" else ""))
+                    " | split packs: ${if (kernelOpts.splitPacks) "on" else "off"}" + (if (SPLIT_PACKS == "auto") " (auto)" else "") +
+                    " | stage-major: ${if (kernelOpts.stageMajor) "on, ${smBytes / (1 shl 20)} MB" else "off"}" +
+                    (if (STAGE_MAJOR == "auto") " (auto)" else "") +
+                    (if (STAGE_MAJOR != "off" && smWhyNot != null) " ($smWhyNot)" else "") +
+                    (if (kernelOpts.stageMajor) " | split rounds: ${if (splitRounds) "on" else "off"}" +
+                            (if (SPLIT_ROUNDS == "auto") " (auto)" else "") else ""))
         }
         RunStatus.noteGpuSetting("Stream reset", (if (kernelOpts.stateTags) "tags" else "clear") +
                 if (STATE_RESET == "auto") " (auto)" else "")
@@ -1024,6 +1112,11 @@ object ClSearch {
                 if (RNG_TABLE_BITS < 0) " (auto)" else "")
         RunStatus.noteGpuSetting("Split pack cards", (if (kernelOpts.splitPacks) "on" else "off") +
                 if (SPLIT_PACKS == "auto") " (auto)" else "")
+        if (kernelOpts.stageMajor) RunStatus.noteGpuSetting("Split rounds", (if (splitRounds) "on" else "off") +
+                if (SPLIT_ROUNDS == "auto") " (auto)" else "")
+        RunStatus.noteGpuSetting("Stage-major first check", (if (kernelOpts.stageMajor) "on" else "off") +
+                (if (STAGE_MAJOR == "auto") " (auto)" else "") +
+                (if (STAGE_MAJOR != "off" && smWhyNot != null) " ($smWhyNot)" else ""))
 
         // Only the memory-resident streams need space; shop streams live in registers.
         val bState = keep(clCreateBuffer(context, CL_MEM_READ_WRITE,
@@ -1041,6 +1134,9 @@ object ClSearch {
             Sizeof.cl_uint.toLong(), null, null))
         args.add(bState); args.add(bHitIndex); args.add(bHitScore); args.add(bHitCount)
         args.add(bOverflow); args.add(bWork)
+        // Round 2 pulls its seeds with a counter of its own.
+        val bWork2 = keep(clCreateBuffer(context, CL_MEM_READ_WRITE, Sizeof.cl_uint.toLong(), null, null))
+        val args2 = ArrayList(args).also { it[it.size - 1] = bWork2 }
 
         val vendor = deviceInfo(device, CL_DEVICE_VENDOR).lowercase()
         val isNvidia = vendor.contains("nvidia")
@@ -1086,13 +1182,38 @@ object ClSearch {
             if (isNvidia && !quiet) append(" -cl-nv-verbose")
         }
         if (!quiet) println("Build options: $buildOptions")
+        // Split rounds: round 1's own cap. Its register-phase work (Buffoon cards, planets) ran
+        // fastest with twice the full-occupancy cap (half the SM's threads); a first stage with
+        // Arcana, Spectral or Soul work also runs per-seed lane-context steps, which hide their
+        // waits better at full occupancy. Measured on an A100: jokers 64 regs +45% over 32;
+        // Souls/tarots/spectrals 32 regs +4-11% over 64.
+        val laneHeavy = stages.isNotEmpty() &&
+                (stageFlagWord(stages[0], conditions, detail) and (ST_SOULS or ST_SOUL_JOKERS or ST_TAROTS or ST_SPECTRALS)) != 0
+        val nvRegs1 = if (!isNvidia || !splitRounds) nvRegs else if (NV_MAX_REGISTERS_R1 == NV_REGISTERS_AUTO) {
+            val full = nvidiaAutoRegisters(device).first
+            (if (laneHeavy) full else minOf(255, full * 2)).also {
+                if (!quiet) println("${label}Round 1 register cap: $it per thread (auto: " +
+                        (if (laneHeavy) "full occupancy, the first check has Arcana/Spectral/Soul work)" else "half the SM's threads)"))
+            }
+        } else NV_MAX_REGISTERS_R1
+        if (isNvidia && splitRounds) RunStatus.noteGpuSetting("Round 1 register cap",
+            (if (nvRegs1 > 0) "$nvRegs1 per thread" else "compiler's choice") +
+                    if (NV_MAX_REGISTERS_R1 == NV_REGISTERS_AUTO) " (auto)" else "")
+        val buildOptions1 = buildString {
+            append(BUILD_OPTIONS)
+            if (isNvidia && nvRegs1 > 0) append(" -cl-nv-maxrregcount=$nvRegs1")
+            if (isNvidia && !quiet) append(" -cl-nv-verbose")
+        }
 
-        fun build(ls: Long): Pair<cl_program, cl_kernel> {
+        /** round: 0 the single kernel, 1 or 2 the split rounds. */
+        fun build(ls: Long, round: Int = 0, base: KernelOpts = kernelOpts): Pair<cl_program, cl_kernel> {
+            val opts = if (round == 2) base.copy(stageMajor = false, twoRound = false) else base
+            val extra = "#define ROUND_KERNEL $round\n#define SM_QCAP $SM_QUEUE_CAP\n"
             val source = buildDefines(conditions, detail, maxSearchAnte, shopItems, streams, useLocalPrefix,
-                stages, globalSize, ls, kernelOpts) + "\n" + loadSource()
+                stages, globalSize, ls, opts) + extra + "\n" + loadSource()
             val program = clCreateProgramWithSource(context, 1, arrayOf(source), null, null)
             try {
-                clBuildProgram(program, 0, null, buildOptions, null, null)
+                clBuildProgram(program, 0, null, if (round == 1) buildOptions1 else buildOptions, null, null)
             } catch (e: CLException) {
                 val size = LongArray(1)
                 clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, null, size)
@@ -1104,25 +1225,57 @@ object ClSearch {
             return program to clCreateKernel(program, "search", null)
         }
 
-        var (program, kernel) = build(localSize)
-        // The compiled kernel's own ceiling: how large a group its register and shared
+        /** One compiled variant: the kernel, and round 2's when the rounds are split. */
+        class Variant(val program: cl_program, val kernel: cl_kernel, val program2: cl_program?, val kernel2: cl_kernel?) {
+            fun release() {
+                clReleaseKernel(kernel); clReleaseProgram(program)
+                kernel2?.let { clReleaseKernel(it) }; program2?.let { clReleaseProgram(it) }
+            }
+        }
+        // Variant 0 is the configured kernel; variant 1, when auto-tuning the RNG table, the
+        // same with the 4-bit table.
+        val variantOpts = if (tuneTable) listOf(kernelOpts, kernelOpts.copy(rngBits = 4)) else listOf(kernelOpts)
+        fun buildAll(ls: Long): List<Variant> = variantOpts.map { o ->
+            val (pr, kr) = build(ls, if (splitRounds) 1 else 0, o)
+            if (splitRounds) { val (p2, k2) = build(ls, 2, o); Variant(pr, kr, p2, k2) } else Variant(pr, kr, null, null)
+        }
+        var variants = buildAll(localSize)
+        // The compiled kernels' own ceiling: how large a group their register and shared
         // memory use allows on this device. Only known after building, so an automatic
         // size that turns out too big is rebuilt once at the largest that fits.
-        val kernelMax = kernelWorkGroupMax(kernel, device)
+        val kernelMax = variants.minOf { v ->
+            minOf(kernelWorkGroupMax(v.kernel, device), v.kernel2?.let { kernelWorkGroupMax(it, device) } ?: Long.MAX_VALUE)
+        }
         if (kernelMax in 1 until localSize) {
             if (LOCAL_SIZE > 0) {
                 throw Unsupported("--local-size $localSize is more than this kernel allows on this device ($kernelMax)")
             }
-            clReleaseKernel(kernel); clReleaseProgram(program)
+            variants.forEach { it.release() }
             localSize = java.lang.Long.highestOneBit(kernelMax)
             while (GLOBAL_SIZE % localSize != 0L && localSize > 1) localSize /= 2
-            val rebuilt = build(localSize)
-            program = rebuilt.first; kernel = rebuilt.second
+            variants = buildAll(localSize)
         }
+        val program = variants[0].program
+        val kernel = variants[0].kernel
+        val program2 = variants[0].program2
+        val kernel2 = variants[0].kernel2
         if (!quiet) println("${label}Work-group size: $localSize" + (if (LOCAL_SIZE > 0) "" else " (automatic)"))
         RunStatus.noteGpuSetting("Work-group size", localSize.toString() + if (LOCAL_SIZE > 0) "" else " (auto)")
         if (!quiet) printKernelInfo(kernel, device)
         if (!quiet && isNvidia) printNvidiaRegisters(program, device)
+        if (!quiet && splitRounds) {
+            println("${label}Round 2 kernel:")
+            printKernelInfo(kernel2!!, device)
+            if (isNvidia) printNvidiaRegisters(program2!!, device)
+        }
+        if (!quiet && tuneTable) {
+            println("${label}RNG table: auto, measuring off against 4-bit on chunks ${TUNE_FIRST + 1}-${TUNE_FIRST + 2 * TUNE_ROUNDS}")
+        }
+        // Auto-tuning: which variant each chunk uses, and what each measured.
+        var active = 0
+        var chunkNo = 0
+        val tuneSeeds = LongArray(variants.size)
+        val tuneNs = LongArray(variants.size)
 
         // CPU mirror, used to verify every hit and to redo anything the device punted.
         val cpuState = MatchState(conditions)
@@ -1188,21 +1341,65 @@ object ClSearch {
             clEnqueueWriteBuffer(queue, bWork, CL_TRUE, 0, Sizeof.cl_uint.toLong(),
                 Pointer.to(intArrayOf(0)), 0, null, null)
 
-            var a = 0
-            for (b in args) clSetKernelArg(kernel, a++, Sizeof.cl_mem.toLong(), Pointer.to(b))
-            clSetKernelArg(kernel, a++, Sizeof.cl_ulong.toLong(), Pointer.to(longArrayOf(base)))
-            clSetKernelArg(kernel, a++, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(chunk)))
-            // The kernel clears streams up to this count; shop streams are not in the buffer.
-            clSetKernelArg(kernel, a++, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(streams.stateCount)))
-            clSetKernelArg(kernel, a++, Sizeof.cl_double.toLong(), Pointer.to(doubleArrayOf(cutoffOf())))
-            clSetKernelArg(kernel, a, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(MAX_HITS)))
+            fun setArgs(k: cl_kernel, bufs: List<cl_mem>, count: Int) {
+                var a = 0
+                for (b in bufs) clSetKernelArg(k, a++, Sizeof.cl_mem.toLong(), Pointer.to(b))
+                clSetKernelArg(k, a++, Sizeof.cl_ulong.toLong(), Pointer.to(longArrayOf(base)))
+                clSetKernelArg(k, a++, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(count)))
+                // The kernel clears streams up to this count; shop streams are not in the buffer.
+                clSetKernelArg(k, a++, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(streams.stateCount)))
+                clSetKernelArg(k, a++, Sizeof.cl_double.toLong(), Pointer.to(doubleArrayOf(cutoffOf())))
+                clSetKernelArg(k, a, Sizeof.cl_int.toLong(), Pointer.to(intArrayOf(MAX_HITS)))
+            }
 
+            val tuning = variants.size > 1 && chunkNo >= TUNE_FIRST && chunkNo < TUNE_FIRST + 2 * TUNE_ROUNDS
+            if (tuning) active = (chunkNo - TUNE_FIRST) % 2
+            val kernel = variants[active].kernel
+            val kernel2 = variants[active].kernel2
             val tKernel = System.nanoTime()
-            clEnqueueNDRangeKernel(queue, kernel, 1, null,
-                longArrayOf(globalSize), longArrayOf(localSize), 0, null, null)
-            clFinish(queue)
+            if (!splitRounds) {
+                setArgs(kernel, args, chunk)
+                clEnqueueNDRangeKernel(queue, kernel, 1, null,
+                    longArrayOf(globalSize), longArrayOf(localSize), 0, null, null)
+                clFinish(queue)
+            } else {
+                // Round 1 over the chunk; whenever it stops because its queue is nearly full,
+                // round 2 drains the queue and round 1 carries on from where it stopped.
+                val one = IntArray(1)
+                while (true) {
+                    clEnqueueWriteBuffer(queue, bSmQueueN, CL_TRUE, 0, Sizeof.cl_uint.toLong(),
+                        Pointer.to(intArrayOf(0)), 0, null, null)
+                    setArgs(kernel, args, chunk)
+                    clEnqueueNDRangeKernel(queue, kernel, 1, null,
+                        longArrayOf(globalSize), longArrayOf(localSize), 0, null, null)
+                    clEnqueueReadBuffer(queue, bSmQueueN, CL_TRUE, 0, Sizeof.cl_uint.toLong(), Pointer.to(one), 0, null, null)
+                    val queued = one[0]
+                    if (queued > 0) {
+                        clEnqueueWriteBuffer(queue, bWork2, CL_TRUE, 0, Sizeof.cl_uint.toLong(),
+                            Pointer.to(intArrayOf(0)), 0, null, null)
+                        setArgs(kernel2!!, args2, queued)
+                        clEnqueueNDRangeKernel(queue, kernel2, 1, null,
+                            longArrayOf(globalSize), longArrayOf(localSize), 0, null, null)
+                    }
+                    clEnqueueReadBuffer(queue, bWork, CL_TRUE, 0, Sizeof.cl_uint.toLong(), Pointer.to(one), 0, null, null)
+                    if (Integer.toUnsignedLong(one[0]) >= chunk.toLong()) break
+                }
+                clFinish(queue)
+            }
             val kernelNs = System.nanoTime() - tKernel
             val tHost = System.nanoTime()
+            if (tuning) {
+                tuneSeeds[active] += chunk.toLong(); tuneNs[active] += kernelNs
+                if (chunkNo == TUNE_FIRST + 2 * TUNE_ROUNDS - 1) {
+                    val rate = DoubleArray(variants.size) { tuneSeeds[it] * 1e9 / maxOf(1L, tuneNs[it]) }
+                    // The table has to win clearly: a couple of chunks each is a noisy measure.
+                    active = if (rate[1] > rate[0] * 1.02) 1 else 0
+                    val choice = if (active == 1) "4-bit" else "off"
+                    if (!quiet) println("${label}RNG table: $choice (auto-tuned: off %.1fM/s, 4-bit %.1fM/s)".format(rate[0] / 1e6, rate[1] / 1e6))
+                    RunStatus.noteGpuSetting("RNG table", "$choice (auto-tuned)")
+                }
+            }
+            chunkNo++
 
             clEnqueueReadBuffer(queue, bHitCount, CL_TRUE, 0, (2 * Sizeof.cl_int).toLong(),
                 Pointer.to(counts), 0, null, null)
@@ -1311,8 +1508,7 @@ object ClSearch {
         }
 
         bufs.forEach { clReleaseMemObject(it) }
-        clReleaseKernel(kernel)
-        clReleaseProgram(program)
+        variants.forEach { it.release() }
         clReleaseCommandQueue(queue)
         clReleaseContext(context)
     }
